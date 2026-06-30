@@ -13,10 +13,11 @@ The research objective of this project is to learn the normal distribution of he
 │   ├── Sub01/ ... Sub40/         # Aligned CSV Data & Labels per subject
 │   └── SubjectInformation.xlsx    # Subjects' anatomical parameters (height, weight, age)
 ├── docs/                         # Scientific & Engineering Documentation
-│   ├── dataset_summary.md        # Folder conventions, channel names, labels and metadata
-│   ├── preprocessing_notes.md    # Sensor specs, acquisition info, windowing and scaling
-│   ├── implementation_plan.md    # Pipeline roadmap (Stages 1–7)
-│   └── design_decisions.md       # Rigorous validation tracker of engineering design choices
+│   ├── dataset_summary.md        # Conventions, channel names, label codes, and file specs
+│   ├── preprocessing_notes.md    # Sensor setup, coordinate system, windowing, and scaling guidelines
+│   ├── implementation_plan.md    # Roadmap (Stages 1–7) and pipeline verification
+│   ├── design_desicions.md       # Decision log tracking parameters and design validations
+│   └── literature_matrix.md      # Literature tracking matrix justifying choices for publication
 ├── preprocessing/                # Clean, modular preprocessing pipeline
 │   ├── __init__.py               # Exports loader, cleaner, conditioner, windower, dataset
 │   ├── loader.py                 # Metadata loading, CSV parsing, and torque weight normalization
@@ -33,6 +34,25 @@ The research objective of this project is to learn the normal distribution of he
 ├── .gitignore                    # Ensures heavy datasets are not committed
 └── README.md                     # Project overview and research onboarding
 ```
+
+---
+
+## 📚 Important Research Documentation
+
+Teammates joining this research project should review the following key markdown files in the [docs/](file:///e:/SIAT/docs/) directory to understand the biomechanical and machine learning rationales behind our pipeline design:
+
+1. **[docs/design_desicions.md](file:///e:/SIAT/docs/design_desicions.md) (Decision Tracking Log):**
+   * Tracks every major pipeline parameter (e.g. window sizes, Butterworth cutoff frequencies, downsampling rate).
+   * Categorizes choices as *Accepted/Verified* (backed by literature) vs *Engineering Decisions* (requiring further empirical validation or search for supporting papers).
+   * Crucial for maintaining research integrity and preventing arbitrary parameter tuning.
+
+2. **[docs/literature_matrix.md](file:///e:/SIAT/docs/literature_matrix.md) (Literature Justification Matrix):**
+   * Acts as a repository of scientific citations.
+   * Maps specific pipeline choices (e.g., $6\text{ Hz}$ kinematics cutoff, torque bodyweight scaling, subject-wise splits) to peer-reviewed gait/biomechanical literature.
+   * Crucial for writing the *Methods* section of the final IEEE conference paper.
+
+3. **[docs/dataset_summary.md](file:///e:/SIAT/docs/dataset_summary.md) & [docs/preprocessing_notes.md](file:///e:/SIAT/docs/preprocessing_notes.md) (Dataset Specs):**
+   * Explains hardware configurations (Vicon/Delsys), coordinate planes, data channel mappings, and synchronized gait phase label codes.
 
 ---
 
