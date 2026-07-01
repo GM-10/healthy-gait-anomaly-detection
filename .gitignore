@@ -1,2 +1,23 @@
-# Dataset
+# Dataset (too large for Git)
 SIAT_LLMD20230404/
+
+# Pipeline outputs (generated at runtime)
+outputs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model weights & SARIMA pickles (large binaries)
+*.pt
+*.pkl
+
+# Scaler params (regenerated from training data)
+scaler_params.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
