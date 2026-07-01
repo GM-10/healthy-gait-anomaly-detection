@@ -1,8 +1,10 @@
 # Unsupervised Gait Anomaly Detection using SIAT-LLMD
 
-This repository contains the official codebase and scientific documentation for the unsupervised, reconstruction-based gait anomaly detection framework using the **SIAT-LLMD** dataset.
+This repository contains the official codebase and scientific documentation for an unsupervised, reconstruction-based gait anomaly detection framework using the **SIAT-LLMD** dataset. The system models the normal distribution of healthy human lower-limb motion across two independent modalities and detects deviations from that baseline using reconstruction error.
 
-The research objective of this project is to learn the normal distribution of healthy human lower-limb kinematics and kinetics, and detect deviations from this healthy baseline using reconstruction error (comparing **SARIMA**, **LSTM**, and **Transformer** autoencoders).
+**Modalities:** sEMG (9 channels) · Kinematics (8 joint angles) · Kinetics (8 joint torques)  
+**Models:** SARIMA · LSTM Autoencoder · Transformer Autoencoder  
+**Fusion:** Late fusion at the anomaly-score level (both pipelines share an identical output CSV schema)
 
 ---
 
@@ -10,144 +12,294 @@ The research objective of this project is to learn the normal distribution of he
 
 ```
 ├── SIAT_LLMD20230404/            # Raw SIAT-LLMD Dataset (ignored by Git)
-│   ├── Sub01/ ... Sub40/         # Aligned CSV Data & Labels per subject
-│   └── SubjectInformation.xlsx    # Subjects' anatomical parameters (height, weight, age)
-├── docs/                         # Scientific & Engineering Documentation
-│   ├── dataset_summary.md        # Conventions, channel names, label codes, and file specs
-│   ├── preprocessing_notes.md    # Sensor setup, coordinate system, windowing, and scaling guidelines
+│   └── SIAT_LLMD20230404/
+│       ├── Sub01/ ... Sub40/     # Aligned CSV Data & Labels per subject
+│       │   ├── Data/             # Sub##_[MOV]_Data.csv  (26 columns @ 1920 Hz)
+│       │   └── Labels/           # Sub##_[MOV]_Label.csv (Time, Status, Group)
+│       └── SubjectInformation.xlsx
+│
+├── semg_pipeline/                # ★ sEMG modality pipeline (this work)
+│   ├── __init__.py               # Public API exports
+│   ├── loader.py                 # sEMG column loading + label-convention detection
+│   ├── filter.py                 # Notch → Bandpass → Rectify → Envelope chain
+│   ├── normalizer.py             # Per-channel MinMax scaler (train-only fit + JSON)
+│   ├── windower.py               # 1920-sample windows, 50% overlap, cycle-safe
+│   ├── anomaly_scorer.py         # μ+3σ threshold + 12-column output CSV builder
+│   ├── evaluator.py              # Recall, F1, RMSE, confusion matrix
+│   ├── run_pipeline.py           # Master orchestration script
+│   └── models/
+│       ├── sarima_model.py       # pmdarima auto_arima per channel
+│       ├── lstm_model.py         # PyTorch LSTM Autoencoder per channel
+│       └── transformer_model.py  # PyTorch Transformer Autoencoder per channel
+│
+├── preprocessing/                # Kinematics/kinetics pipeline (teammate)
+│   ├── __init__.py
+│   ├── loader.py                 # Metadata loading, CSV parsing, torque normalization
+│   ├── inspector.py              # NaN/Inf tracking, IQR outlier detection
+│   ├── cleaner.py                # Cycle alignment, cubic spline interpolation
+│   ├── conditioner.py            # Butterworth filtering, downsampling, min-max scaling
+│   ├── windower.py               # Sliding window segmentation within cycle bounds
+│   └── dataset.py                # PyTorch Dataset wrappers and split generators
+│
+├── utils/
+│   └── synthetic_anomalies.py    # Shared anomaly injection module (both pipelines)
+│
+├── outputs/                      # Generated at runtime (ignored by Git)
+│   └── sEMG/
+│       ├── scaler_params.json    # Fitted MinMax params (train subjects only)
+│       ├── models/               # Saved model weights & SARIMA pickles
+│       ├── Sub36/ ... Sub40/     # Per-subject output CSVs
+│       └── evaluation_summary.csv
+│
+├── docs/                         # Scientific & engineering documentation
+│   ├── dataset_summary.md        # Conventions, channel names, label codes, file specs
+│   ├── preprocessing_notes.md    # Sensor setup, coordinate system, windowing guidelines
 │   ├── implementation_plan.md    # Roadmap (Stages 1–7) and pipeline verification
-│   ├── design_desicions.md       # Decision log tracking parameters and design validations
-│   └── literature_matrix.md      # Literature tracking matrix justifying choices for publication
-├── preprocessing/                # Clean, modular preprocessing pipeline
-│   ├── __init__.py               # Exports loader, cleaner, conditioner, windower, dataset
-│   ├── loader.py                 # Metadata loading, CSV parsing, and torque weight normalization
-│   ├── inspector.py              # Sanity checks (NaN/Inf tracking) and IQR outlier detection
-│   ├── cleaner.py                # Cycle frame alignment and cubic spline interpolation
-│   ├── conditioner.py            # Butterworth filtering, downsampling, and min-max scaling
-│   ├── windower.py               # Sliding window segmentation restricted within cycle bounds
-│   └── dataset.py                # PyTorch Dataset wrappers and subject-wise split generators
-├── utils/                        # Shared mathematical utilities
-│   └── synthetic_anomalies.py    # Standardized synthetic anomaly injection module
-├── config/                       # Pipeline configuration files (future use)
-├── models/                       # SARIMA, LSTM, Transformer Autoencoders (future use)
-├── evaluation/                   # Evaluator and ROC-AUC curve scripts (future use)
-├── .gitignore                    # Ensures heavy datasets are not committed
-└── README.md                     # Project overview and research onboarding
+│   └── design_desicions.md       # Decision log tracking parameters and validations
+│
+├── .gitignore
+└── README.md
 ```
 
 ---
 
 ## 📚 Important Research Documentation
 
-Teammates joining this research project should review the following key markdown files in the [docs/](file:///e:/SIAT/docs/) directory to understand the biomechanical and machine learning rationales behind our pipeline design:
+Teammates should review these files in `docs/` before making changes:
 
-1. **[docs/design_desicions.md](file:///e:/SIAT/docs/design_desicions.md) (Decision Tracking Log):**
-   * Tracks every major pipeline parameter (e.g. window sizes, Butterworth cutoff frequencies, downsampling rate).
-   * Categorizes choices as *Accepted/Verified* (backed by literature) vs *Engineering Decisions* (requiring further empirical validation or search for supporting papers).
-   * Crucial for maintaining research integrity and preventing arbitrary parameter tuning.
+1. **`docs/design_desicions.md`** — Decision tracking log. Every major pipeline parameter is categorized as *Accepted/Verified* (literature-backed) vs *Engineering Decision* (needs validation). Prevents arbitrary parameter tuning.
 
-2. **[docs/literature_matrix.md](file:///e:/SIAT/docs/literature_matrix.md) (Literature Justification Matrix):**
-   * Acts as a repository of scientific citations.
-   * Maps specific pipeline choices (e.g., $6\text{ Hz}$ kinematics cutoff, torque bodyweight scaling, subject-wise splits) to peer-reviewed gait/biomechanical literature.
-   * Crucial for writing the *Methods* section of the final IEEE conference paper.
+2. **`docs/dataset_summary.md`** — Full label convention reference, channel mappings, and gait phase codes. **Read this before touching any loader.** The Status column encodes differently across movement types (see [Label Conventions](#%EF%B8%8F-label-conventions) below).
 
-3. **[docs/dataset_summary.md](file:///e:/SIAT/docs/dataset_summary.md) & [docs/preprocessing_notes.md](file:///e:/SIAT/docs/preprocessing_notes.md) (Dataset Specs):**
-   * Explains hardware configurations (Vicon/Delsys), coordinate planes, data channel mappings, and synchronized gait phase label codes.
+3. **`docs/preprocessing_notes.md`** — Hardware setup (Vicon/Delsys Trigno), coordinate systems, filtering rationale.
 
 ---
 
-## 🔬 The Preprocessing Pipeline (Stages 1–7)
+## ⚠️ Label Conventions
 
-The `preprocessing` package processes high-frequency synchronized multi-modal data in a clean, unified, and zero-leakage workflow:
+The `Status` column in label CSVs uses **three different encoding schemes** depending on movement type. Both pipelines handle this automatically.
+
+| Movement type | Movements | Status values | Active condition |
+|---|---|---|---|
+| Cyclic gait phases | WAK, UPS, DNS | `1.0` – `5.0` (phase codes) | All non-NaN rows |
+| Discrete A/R | LLB, LLF, LLS, LUGB, LUGF, KLCL, KLFT, HS, SITDN, STDUP, TPTO, TO | `'A'` / `'R'` strings | `Status == 'A'` only |
+| Static | STC | `'R'` only | No active frames |
+
+---
+
+## 🦵 sEMG Pipeline (`semg_pipeline/`)
+
+Processes raw sEMG signals at native **1920 Hz** (no downsampling — required to preserve the 15–400 Hz EMG frequency band). All three models are trained in an autoencoder style: anomaly score = reconstruction MSE.
+
+### Signal Processing Chain
+
+```mermaid
+graph LR
+    A[Raw sEMG 1920 Hz] --> B[Notch 50 Hz]
+    B --> C[Bandpass 15–400 Hz]
+    C --> D[Full-wave rectify]
+    D --> E[LP envelope 6 Hz]
+    E --> F[MinMax scale −1 to 1]
+    F --> G[1920-sample windows\n50% overlap\nwithin gait cycle]
+```
+
+### Models
+
+| Model | Architecture | Notes |
+|---|---|---|
+| **SARIMA** | `pmdarima.auto_arima` per channel | Trains on ≤5 subjects (slow); documented limitation |
+| **LSTM AE** | Encoder LSTM(64) → RepeatVector → Decoder LSTM(64) → Linear | Input: `(1920, 1)` per channel |
+| **Transformer AE** | Sinusoidal PE + TransformerEncoder(d=64, heads=4, layers=2) → Linear | Input: `(1920, 1)` per channel |
+
+**Training:** MSE loss · Adam lr=0.001 · 50 epochs · batch 32 · early stopping patience=5 on val loss · seed=42
+
+**Threshold:** `mean(train_errors) + 3 × std(train_errors)` per channel per model
+
+### Subject Split
+
+| Split | Subjects | Role |
+|---|---|---|
+| Train | Sub01 – Sub30 | Fit scaler + train models + compute thresholds |
+| Validation | Sub31 – Sub35 | Early stopping for LSTM & Transformer |
+| Test | Sub36 – Sub40 | Score clean + synthetic anomaly windows |
+
+### Synthetic Anomaly Injection (Test Set)
+
+10 anomaly conditions are applied to each clean test window (imported from the shared `utils/synthetic_anomalies.py`):
+
+| Type | Severities | Clinical simulation |
+|---|---|---|
+| `amplitude_scale` | mild / moderate / severe | Muscle weakness, reduced ROM |
+| `time_warp` | mild / moderate / severe | Hemiparetic asymmetric gait |
+| `time_shift` | mild / moderate / severe | Neuromuscular activation delay |
+| `combined` | moderate (all three) | Compound pathology |
+
+### Output CSV Schema
+
+One CSV per subject × movement × model. **Column names are identical to the kinematics/kinetics pipeline for late fusion.**
+
+```
+subject_id, modality, channel_name, movement, window_id,
+window_start_time, window_end_time, reconstruction_error,
+is_synthetic_anomaly, anomaly_type, predicted_label, model_name
+```
+
+- `modality` is always `"sEMG"`
+- `is_synthetic_anomaly`: `0` = clean, `1` = injected anomaly
+- `predicted_label`: `1` if `reconstruction_error > threshold`, else `0`
+
+---
+
+## 🦴 Kinematics/Kinetics Pipeline (`preprocessing/`)
+
+Processes joint angles and torques at **120 Hz** (downsampled from 1920 Hz). Follows a 7-stage pipeline:
 
 ```mermaid
 graph TD
-    A[Raw Data: 1920 Hz CSVs] --> B[Stage 1: Loader]
-    B --> C[Stage 2: Inspector]
-    C --> D[Stage 3: Cleaner]
-    D --> E[Stage 4: Conditioner]
-    E --> F[Stage 5: Windower]
-    F --> G[Stage 6: Dataset Prep]
-    G --> H[Stage 7: DataLoader Outputs]
+    A[Raw 1920 Hz CSVs] --> B[Stage 1: Load + weight-normalize torques]
+    B --> C[Stage 2: Inspect NaN/Inf/outliers]
+    C --> D[Stage 3: Clean boundary frames + interpolate]
+    D --> E[Stage 4: LP filter + downsample to 120 Hz + MinMax scale]
+    E --> F[Stage 5: Sliding windows 180 samples @ 120 Hz]
+    F --> G[Stage 6: PyTorch Dataset + DataLoaders]
+    G --> H[Stage 7: Verification]
 ```
 
-### **Stage 1: Dataset Loading (`loader.py`)**
-Loads physical subject metadata (e.g. weights) and aligns synchronized kinematic (8 channels of joint angles) and kinetic (8 channels of joint torques) signals.
-* **Torque Weight-Normalization:** Normalizes joint torques by each subject's body weight to compute biological joint moments ($N \cdot m / kg$), enabling cross-subject comparisons.
-
-### **Stage 2: Signal Inspection (`inspector.py`)**
-Verifies signal integrity (detects missing values/constant signals) and flags transient spikes or motion capture artifacts using Interquartile Range (**IQR**) outlier detection.
-
-### **Stage 3: Data Cleaning (`cleaner.py`)**
-* **Cycle Alignment:** Discards initialization and boundary transition frames (where Status is `NaN`) so that training is restricted strictly to continuous cyclic walking.
-* **Interpolation:** Fills minor tracking dropouts using cubic spline interpolation.
-
-### **Stage 4: Preprocessing & Conditioning (`conditioner.py`)**
-* **Zero-Phase Butterworth Filtering:** Applies bidirectional low-pass filtering to eliminate high-frequency marker jitter and impact noise without introducing temporal phase shifts (Cutoffs: **$6\text{ Hz}$** for kinematics; **$10\text{ Hz}$** for kinetics).
-* **Decimation Downsampling:** Downsamples high-frequency synchronized data from **$1920\text{ Hz} \to 120\text{ Hz}$** to make sequence lengths computationally manageable for recurrent and attention models.
-* **Scaling:** Applies subject-specific Min-Max scaling to target range **$[-1.0, 1.0]$** to balance joint features.
-
-### **Stage 5: Window Generation (`windower.py`)**
-Segments continuous signals into fixed-size overlapping sliding windows (e.g., $1.0\text{ second}$ / $120\text{ frames}$ at $120\text{ Hz}$).
-* **Cycle Bound Constraint:** Statically enforces that all samples in a window must belong to the same cyclic `Group` index to prevent cross-stride boundaries from contaminating windows.
-
-### **Stage 6: Dataset Preparation (`dataset.py`)**
-Wraps the processed windows into PyTorch `SIATGaitDataset` and outputs standard PyTorch `DataLoaders`.
-* **Zero-Leakage Subject Split:** Partitions the cohort subject-wise:
-  * **Train:** Subjects 01–30
-  * **Validation:** Subjects 31–35
-  * **Test:** Subjects 36–40
-  * *Train scaling parameters are saved and applied to Validation and Test sets to prevent validation leakage.*
-
-### **Stage 7: Verification**
-An automated verification test script (`scratch/test_pipeline.py`) validates the pipeline shape, range boundaries, and split sizes.
+**Window size:** 180 samples = 1.5 s at 120 Hz · **Overlap:** 90 samples (50%)
 
 ---
 
-## ⚠️ Synthetic Anomaly Injection (`utils/synthetic_anomalies.py`)
+## ⚠️ Synthetic Anomaly Module (`utils/synthetic_anomalies.py`)
 
-Because the SIAT-LLMD cohort contains only healthy participants, we simulate realistic gait pathologies mathematically to obtain ground-truth labels for evaluation:
+Both pipelines import this **same file**. Do not create separate copies — consistency across modalities is required for late fusion to be valid.
 
-1. **Amplitude Scaling:** Simulates reduced range of motion (e.g. joint stiffness or muscle weakness) by scaling signal deviation down around its mean.
-2. **Time Warping:** Simulates temporal asymmetry (e.g., stroke hemiparetic gait) by stretching the first half of a stride and compressing the second half.
-3. **Time Shifting:** Simulates delayed muscle activation (neuromuscular latency) by shifting the sequence forward and applying edge-hold padding.
-
-*Both teammates (sEMG pipeline and kinematics/kinetics pipeline) import this shared file to ensure that anomaly definitions, labels (`0` for clean, `1` for anomalous), and severity parameters (`mild=0.15`, `moderate=0.35`, `severe=0.60`) are identical for later multimodal fusion.*
+```python
+from utils.synthetic_anomalies import (
+    inject_amplitude_scale,   # Reduced range of motion
+    inject_time_warp,         # Asymmetric gait timing
+    inject_time_shift,        # Delayed activation
+    inject_combined,          # All three combined
+    DEFAULT_SEVERITIES,       # {'mild': 0.15, 'moderate': 0.35, 'severe': 0.60}
+    ANOMALY_TYPES,            # Canonical anomaly_type strings for output CSV
+)
+```
 
 ---
 
 ## 🚀 Getting Started
 
-### 1. Setup the Environment
-Configure the Python environment using the supplied yaml file:
+### 1. Install Dependencies
+
+```bash
+pip install numpy pandas scipy torch pmdarima scikit-learn
+```
+
+Or use the supplied conda environment:
 ```bash
 conda env create -f SIAT_LLMD20230404/Code/codeV4.2/environments/sEMG_IR.yaml
 conda activate sEMG_IR20210903
 ```
 
-### 2. Verify the Pipeline
-To verify the entire loading, filtering, and windowing pipeline, run the verification script:
-```bash
-python .system_generated/../scratch/test_pipeline.py
-```
-*(The script will verify loaders, min-max ranges, subject-wise splits, and print `Pipeline verification SUCCESS!`)*
+### 2. Run the sEMG Pipeline
 
-### 3. Usage Example
-Here is how to load the data loaders in your modeling script:
+```bash
+# Smoke-test (2 train subjects, 1 test subject, LSTM only, WAK movement):
+python -m semg_pipeline.run_pipeline \
+    --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404 \
+    --movements WAK --models lstm --dry_run
+
+# Full pipeline — all models, all 16 movements:
+python -m semg_pipeline.run_pipeline \
+    --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404
+
+# Skip retraining — reload saved weights and re-score:
+python -m semg_pipeline.run_pipeline \
+    --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404 \
+    --skip_training --models lstm transformer
+
+# SARIMA only with reduced subset:
+python -m semg_pipeline.run_pipeline \
+    --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404 \
+    --models sarima --sarima_max_subjects 3
+```
+
+### 3. Use the sEMG Pipeline Programmatically
+
+```python
+from semg_pipeline import (
+    load_semg_trial, build_trial_paths,
+    apply_semg_filter_chain,
+    fit_scaler, apply_scaler,
+    create_semg_windows,
+)
+
+# Load one trial (active frames only, label-convention-aware)
+data_path, label_path = build_trial_paths(
+    "SIAT_LLMD20230404/SIAT_LLMD20230404", "Sub01", "WAK"
+)
+df = load_semg_trial(data_path, label_path)
+
+# Filter at 1920 Hz
+df = apply_semg_filter_chain(df)
+
+# Fit scaler on training data, apply to any split
+params = fit_scaler([df])           # pass list of all train trial DFs
+df_scaled = apply_scaler(df, params)
+
+# Window: shape (N, 1920, 9)
+windows, metadata = create_semg_windows(df_scaled)
+```
+
+### 4. Use the Kinematics/Kinetics Pipeline
+
 ```python
 from preprocessing import get_subject_split_loaders
 
 train_loader, val_loader, test_loader, scaling_params = get_subject_split_loaders(
-    base_dir="SIAT_LLMD20230404",
-    movements=['WAK'],
-    window_size=120,    # 1.0 second window at 120 Hz
-    overlap_size=60,    # 50% overlap
+    base_dir="SIAT_LLMD20230404/SIAT_LLMD20230404",
+    movements=["WAK"],
+    window_size=180,     # 1.5 s @ 120 Hz
+    overlap_size=90,     # 50% overlap
     batch_size=32,
-    target_fs=120.0
+    target_fs=120.0,
 )
 
 for batch_x, batch_meta in train_loader:
-    # batch_x shape: (32, 120, 16)
-    # batch_meta: dict containing subjects, movements, and gait phases
+    # batch_x shape: (32, 180, 16)  — 8 kinematic + 8 kinetic channels
     pass
 ```
+
+---
+
+## 🔗 Late Fusion
+
+Both pipelines produce output CSVs with identical column schemas. To fuse:
+
+```python
+import pandas as pd
+
+semg_df = pd.read_csv("outputs/sEMG/Sub36/Sub36_WAK_LSTM_scores.csv")
+kine_df = pd.read_csv("outputs/kinematics/Sub36/Sub36_WAK_LSTM_scores.csv")
+
+# Merge on shared keys — then fuse scores (e.g. max, mean, product rule)
+fused = pd.merge(semg_df, kine_df, on=["subject_id", "movement", "window_id"],
+                 suffixes=("_semg", "_kine"))
+fused["fused_score"] = fused[["reconstruction_error_semg",
+                               "reconstruction_error_kine"]].mean(axis=1)
+```
+
+---
+
+## 📋 sEMG Channel Reference
+
+| Index | CSV column name | Canonical name (output CSV) |
+|---|---|---|
+| 17 | `sEMG: tensor fascia lata` | `tensor_fascia_lata` |
+| 18 | `sEMG: rectus femoris` | `rectus_femoris` |
+| 19 | `sEMG: vastus medialis` | `vastus_medialis` |
+| 20 | `sEMG: semimembranosus` | `semimembranosus` |
+| 21 | `sEMG: upper tibialis anterior` | `upper_tibialis_anterior` |
+| 22 | `sEMG: lower tibialis anterior` | `lower_tibialis_anterior` |
+| 23 | `sEMG: lateral gastrocnemius` | `lateral_gastrocnemius` |
+| 24 | `sEMG: medial gastrocnemius` | `medial_gastrocnemius` |
+| 25 | `sEMG: soleus` | `soleus` |
