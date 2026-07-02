@@ -68,8 +68,8 @@ logging.basicConfig(
 logger = logging.getLogger("kinetics_pipeline")
 
 # Constants
-WINDOW_SIZE  = 180   # 1.5 seconds at 120 Hz
-OVERLAP_SIZE = 90    # 50% overlap
+WINDOW_SIZE  = 100   # ~0.83 seconds at 120 Hz
+OVERLAP_SIZE = 50    # 50% overlap
 TARGET_FS    = 120.0
 
 MOVEMENTS = [
@@ -434,12 +434,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Process reduced subject list for smoke-testing.",
     )
+    parser.add_argument(
+        "--subjects",
+        nargs="+",
+        default=None,
+        help="Custom list of subjects for train/val/test splits",
+    )
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=100,
+        help="Window size in frames",
+    )
+    parser.add_argument(
+        "--overlap_size",
+        type=int,
+        default=50,
+        help="Overlap size in frames",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global WINDOW_SIZE, OVERLAP_SIZE
     args = parse_args()
     t0   = time.time()
+
+    if args.window_size is not None:
+        WINDOW_SIZE = args.window_size
+    if args.overlap_size is not None:
+        OVERLAP_SIZE = args.overlap_size
 
     logger.info("=" * 65)
     logger.info("  Kinematics + Kinetics Anomaly Detection Pipeline")
@@ -449,11 +473,18 @@ def main() -> None:
     logger.info(f"  movements  : {args.movements}")
     logger.info(f"  models     : {args.models}")
     logger.info(f"  dry_run    : {args.dry_run}")
+    logger.info(f"  window_size: {WINDOW_SIZE}")
+    logger.info(f"  overlap    : {OVERLAP_SIZE}")
 
     model_dir = os.path.join(args.output_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
 
-    if args.dry_run:
+    if args.subjects is not None:
+        train_subs = args.subjects
+        val_subs   = args.subjects
+        test_subs  = args.subjects
+        logger.info(f"Using custom subject list: {args.subjects}")
+    elif args.dry_run:
         train_subs = ["Sub01", "Sub02"]
         val_subs   = ["Sub31"]
         test_subs  = ["Sub36"]
