@@ -15,6 +15,7 @@ import os
 import pickle
 import logging
 import warnings
+import copy
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 
@@ -168,7 +169,9 @@ class SARIMAModel:
                 try:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
-                        arima_updated = arima.update(context, maxiter=0)
+                        # Deepcopy to prevent in-place update from polluting clean model state
+                        arima_copy = copy.deepcopy(arima)
+                        arima_updated = arima_copy.update(context, maxiter=0, refit=False)
                         forecast, _   = arima_updated.predict(n_periods=n_pred, return_conf_int=True)
                 except Exception as e:
                     logger.debug(f"[SARIMA] Window {w_idx} ch {ch_idx} predict failed: {e}")
