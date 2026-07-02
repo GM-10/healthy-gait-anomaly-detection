@@ -1,54 +1,18 @@
 """
-semg_pipeline/run_pipeline.py
+kinetics_pipeline/run_pipeline.py
 
-Master orchestration script for the sEMG anomaly detection pipeline.
+Master orchestration script for the Kinematics + Kinetics anomaly detection pipeline.
 
 Runs the complete pipeline end-to-end:
-    1. Load + filter + normalize all training trials
-    2. Fit Min-Max scaler on train subjects only
-    3. Segment into windows (1920 samples, 50% overlap, cycle-safe)
-    4. Train SARIMA / LSTM / Transformer models (one per channel)
-    5. Compute per-channel thresholds from training reconstruction errors
-    6. Process validation set (early stopping for LSTM & Transformer)
-    7. Process test set: score clean + synthetically injected windows
-    8. Save output CSVs per subject per movement per model
-    9. Run evaluation: Recall, F1, RMSE, confusion matrix
-   10. Save aggregate evaluation summary
-
-Subject splits (must match kinematics/kinetics teammate exactly):
-    Train:      Sub01 – Sub30
-    Validation: Sub31 – Sub35
-    Test:       Sub36 – Sub40
-
-Output structure:
-    outputs/sEMG/
-    ├── scaler_params.json
-    ├── models/
-    │   ├── lstm/          ← LSTM model weights
-    │   ├── transformer/   ← Transformer model weights
-    │   └── sarima/        ← SARIMA pickle files
-    ├── Sub36/
-    │   ├── Sub36_WAK_LSTM_scores.csv
-    │   ├── Sub36_WAK_Transformer_scores.csv
-    │   └── Sub36_WAK_SARIMA_scores.csv
-    ├── ...
-    └── evaluation_summary.csv
-
-Usage
------
-    # Full pipeline (all models, all movements):
-    python -m semg_pipeline.run_pipeline \
-        --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404
-
-    # Quick smoke-test (1 subject, 1 movement, LSTM only):
-    python -m semg_pipeline.run_pipeline \
-        --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404 \
-        --movements WAK --models lstm --dry_run
-
-    # Skip training (load saved weights) and only score test set:
-    python -m semg_pipeline.run_pipeline \
-        --base_dir SIAT_LLMD20230404/SIAT_LLMD20230404 \
-        --skip_training --models lstm transformer
+    1. Load all training trials and fit Min-Max scaler using SIATGaitDataset
+    2. Segment into windows (180 samples, 50% overlap)
+    3. Train SARIMA / LSTM / Transformer models (one per channel)
+    4. Compute per-channel thresholds from training reconstruction errors
+    5. Process validation set (early stopping for LSTM & Transformer)
+    6. Process test set: score clean + synthetically injected windows
+    7. Save output CSVs per subject per movement per model
+    8. Run evaluation: Recall, F1, RMSE, confusion matrix
+    9. Save aggregate evaluation summary
 """
 
 import argparse
@@ -56,71 +20,66 @@ import logging
 import os
 import sys
 import time
+import json
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# ── Ensure repo root is on sys.path so we can import utils.synthetic_anomalies
+# Ensure repo root is on sys.path
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-# ── sEMG pipeline imports
-from semg_pipeline.loader import (
-    load_semg_trial,
-    build_trial_paths,
-    SEMG_CHANNELS,
-    MOVEMENTS,
-    TRAIN_SUBS,
-    VAL_SUBS,
-    TEST_SUBS,
-)
-from semg_pipeline.filter     import apply_semg_filter_chain
-from semg_pipeline.normalizer import fit_scaler, apply_scaler, save_scaler, load_scaler
-from semg_pipeline.windower   import create_semg_windows
-from semg_pipeline.anomaly_scorer import (
+# Imports from preprocessing
+from preprocessing.loader import SIGNAL_COLUMNS
+from preprocessing.dataset import SIATGaitDataset
+
+# Imports from kinetics_pipeline
+from kinetics_pipeline.anomaly_scorer import (
     compute_threshold,
     label_windows,
     build_output_rows,
     score_and_build_rows,
 )
-from semg_pipeline.evaluator import (
+from kinetics_pipeline.evaluator import (
     evaluate_model,
     evaluate_aggregate,
     save_evaluation_report,
     print_evaluation_summary,
 )
 
-# ── Shared synthetic anomaly injection (must import from repo root)
+# Shared synthetic anomaly injection
 from utils.synthetic_anomalies import (
     inject_amplitude_scale,
     inject_time_warp,
     inject_time_shift,
     inject_combined,
     DEFAULT_SEVERITIES,
-    ANOMALY_TYPES,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Logging setup
-# ─────────────────────────────────────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("semg_pipeline")
+logger = logging.getLogger("kinetics_pipeline")
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Constants
-# ─────────────────────────────────────────────────────────────────────────────
+WINDOW_SIZE  = 180   # 1.5 seconds at 120 Hz
+OVERLAP_SIZE = 90    # 50% overlap
+TARGET_FS    = 120.0
 
-WINDOW_SIZE  = 1920   # 1 second at 1920 Hz
-OVERLAP_SIZE = 960    # 50% overlap
-FS           = 1920.0
+MOVEMENTS = [
+    "WAK", "UPS", "DNS", "HS", "KLCL", "KLFT", "LLB", "LLF",
+    "LLS", "LUGB", "LUGF", "SITDN", "STC", "STDUP", "TO", "TPTO"
+]
+
+TRAIN_SUBS = [f"Sub{i:02d}" for i in range(1, 31)]
+VAL_SUBS   = [f"Sub{i:02d}" for i in range(31, 36)]
+TEST_SUBS  = [f"Sub{i:02d}" for i in range(36, 41)]
 
 MODEL_REGISTRY = {
     "sarima":       "SARIMA",
@@ -128,8 +87,7 @@ MODEL_REGISTRY = {
     "transformer":  "Transformer",
 }
 
-# Synthetic anomaly conditions applied to every test window
-# Each entry: (function, {kwargs}, anomaly_type_string)
+
 def _build_anomaly_conditions():
     conditions = []
     inject_fns = [
@@ -140,115 +98,33 @@ def _build_anomaly_conditions():
     for fn, atype in inject_fns:
         for level, sev in DEFAULT_SEVERITIES.items():
             conditions.append((fn, {"severity": sev}, atype, level))
-    # Combined anomaly uses moderate severity for all three types
     conditions.append((inject_combined, {}, "combined", "moderate"))
-    return conditions   # 10 conditions total
+    return conditions
 
 ANOMALY_CONDITIONS = _build_anomaly_conditions()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: load + filter + window a single trial
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _process_trial(
-    base_dir: str,
-    subject: str,
-    movement: str,
-    scaling_params: Optional[Dict] = None,
-    filter_only: bool = False,
-) -> Tuple[Optional[pd.DataFrame], Optional[np.ndarray], Optional[List]]:
-    """
-    Load → filter → [scale] → window a single trial.
-
-    Returns
-    -------
-    (filtered_df, windows_array, windows_meta)
-    Any of which can be None if the trial files are missing or yield 0 windows.
-    """
-    data_path, label_path = build_trial_paths(base_dir, subject, movement)
-
-    if not os.path.exists(data_path) or not os.path.exists(label_path):
-        return None, None, None
-
-    try:
-        df = load_semg_trial(data_path, label_path, active_only=True)
-    except Exception as e:
-        logger.warning(f"  [load] {subject}/{movement}: {e}")
-        return None, None, None
-
-    if df.empty:
-        return None, None, None
-
-    # Filter chain (applied at native 1920 Hz)
-    df = apply_semg_filter_chain(df, fs=FS)
-
-    if filter_only:
-        return df, None, None
-
-    # Scale (apply pre-fitted params; if None, skip scaling)
-    if scaling_params is not None:
-        df = apply_scaler(df, scaling_params)
-
-    # Window
-    windows, meta = create_semg_windows(df, WINDOW_SIZE, OVERLAP_SIZE)
-    if len(windows) == 0:
-        return df, None, None
-
-    return df, windows, meta
+# Scaler serialization helpers
+def save_scaler(params: Dict[str, Tuple[float, float]], path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    serializable = {ch: list(v) for ch, v in params.items()}
+    with open(path, "w") as f:
+        json.dump(serializable, f, indent=2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 1: Collect training windows
-# ─────────────────────────────────────────────────────────────────────────────
-
-def collect_split_windows(
-    base_dir: str,
-    subjects: List[str],
-    movements: List[str],
-    scaling_params: Optional[Dict],
-    split_label: str = "train",
-) -> Tuple[np.ndarray, List[Dict]]:
-    """
-    Load and window all trials for a subject split.
-
-    Returns
-    -------
-    (all_windows, all_meta) — concatenated across all subjects × movements
-    """
-    all_windows = []
-    all_meta    = []
-
-    n = len(subjects) * len(movements)
-    done = 0
-    for sub in subjects:
-        for mov in movements:
-            done += 1
-            logger.info(f"  [{split_label}] {sub}/{mov}  ({done}/{n})")
-            _, windows, meta = _process_trial(
-                base_dir, sub, mov, scaling_params
-            )
-            if windows is not None and len(windows) > 0:
-                all_windows.append(windows)
-                all_meta.extend(meta)
-
-    if not all_windows:
-        logger.warning(f"No windows collected for {split_label} split.")
-        return np.empty((0, WINDOW_SIZE, len(SEMG_CHANNELS)), dtype=np.float32), []
-
-    return np.concatenate(all_windows, axis=0), all_meta
+def load_scaler(path: str) -> Dict[str, Tuple[float, float]]:
+    with open(path, "r") as f:
+        raw = json.load(f)
+    return {ch: tuple(v) for ch, v in raw.items()}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: Build & train models
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Training helpers
 def _train_sarima(
     train_windows: np.ndarray,
     model_dir: str,
     sarima_train_subs: int,
 ) -> "SARIMAModel":
-    from semg_pipeline.models.sarima_model import SARIMAModel, SARIMA_MAX_TRAIN_SUBJECTS
+    from kinetics_pipeline.models.sarima_model import SARIMAModel, SARIMA_MAX_TRAIN_SUBJECTS
 
     max_subs = sarima_train_subs or SARIMA_MAX_TRAIN_SUBJECTS
     logger.info(
@@ -256,7 +132,7 @@ def _train_sarima(
         f"({len(train_windows)} total train windows available)."
     )
     model = SARIMAModel(
-        channel_names=SEMG_CHANNELS,
+        channel_names=SIGNAL_COLUMNS,
         max_windows_per_channel=200,
         model_dir=os.path.join(model_dir, "sarima"),
     )
@@ -269,11 +145,11 @@ def _train_lstm(
     val_windows: np.ndarray,
     model_dir: str,
 ) -> List:
-    from semg_pipeline.models.lstm_model import LSTMModel
+    from kinetics_pipeline.models.lstm_model import LSTMModel
 
     models = []
-    for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
-        logger.info(f"[LSTM] Training channel {ch_idx + 1}/9: {ch_name}")
+    for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
+        logger.info(f"[LSTM] Training channel {ch_idx + 1}/16: {ch_name}")
         m = LSTMModel(channel_name=ch_name, window_size=WINDOW_SIZE)
         train_ch = train_windows[:, :, ch_idx : ch_idx + 1]
         val_ch   = val_windows[:, :, ch_idx : ch_idx + 1] if len(val_windows) > 0 else None
@@ -289,11 +165,11 @@ def _train_transformer(
     val_windows: np.ndarray,
     model_dir: str,
 ) -> List:
-    from semg_pipeline.models.transformer_model import TransformerModel
+    from kinetics_pipeline.models.transformer_model import TransformerModel
 
     models = []
-    for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
-        logger.info(f"[Transformer] Training channel {ch_idx + 1}/9: {ch_name}")
+    for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
+        logger.info(f"[Transformer] Training channel {ch_idx + 1}/16: {ch_name}")
         m = TransformerModel(channel_name=ch_name, window_size=WINDOW_SIZE)
         train_ch = train_windows[:, :, ch_idx : ch_idx + 1]
         val_ch   = val_windows[:, :, ch_idx : ch_idx + 1] if len(val_windows) > 0 else None
@@ -304,14 +180,11 @@ def _train_transformer(
     return models
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 3: Load pre-trained models
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Model loading helpers
 def _load_lstm_models(model_dir: str) -> List:
-    from semg_pipeline.models.lstm_model import LSTMModel
+    from kinetics_pipeline.models.lstm_model import LSTMModel
     models = []
-    for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
+    for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
         m = LSTMModel(channel_name=ch_name, window_size=WINDOW_SIZE)
         path = os.path.join(model_dir, "lstm", f"lstm_ch{ch_idx:02d}.pt")
         if os.path.exists(path):
@@ -323,9 +196,9 @@ def _load_lstm_models(model_dir: str) -> List:
 
 
 def _load_transformer_models(model_dir: str) -> List:
-    from semg_pipeline.models.transformer_model import TransformerModel
+    from kinetics_pipeline.models.transformer_model import TransformerModel
     models = []
-    for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
+    for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
         m = TransformerModel(channel_name=ch_name, window_size=WINDOW_SIZE)
         path = os.path.join(model_dir, "transformer", f"transformer_ch{ch_idx:02d}.pt")
         if os.path.exists(path):
@@ -337,39 +210,29 @@ def _load_transformer_models(model_dir: str) -> List:
 
 
 def _load_sarima_models(model_dir: str) -> "SARIMAModel":
-    from semg_pipeline.models.sarima_model import SARIMAModel
+    from kinetics_pipeline.models.sarima_model import SARIMAModel
     m = SARIMAModel(
-        channel_names=SEMG_CHANNELS,
+        channel_names=SIGNAL_COLUMNS,
         model_dir=os.path.join(model_dir, "sarima"),
     )
     m.load(os.path.join(model_dir, "sarima"))
     return m
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 4: Compute train thresholds
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Threshold computing helper
 def compute_train_thresholds(
     active_models: Dict[str, object],
     train_windows: np.ndarray,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Compute per-model per-channel anomaly thresholds from training windows.
-
-    Returns
-    -------
-    thresholds[model_key][channel_name] = float threshold
-    """
     thresholds: Dict[str, Dict[str, float]] = {}
 
     for model_key, model_or_list in active_models.items():
         logger.info(f"[Threshold] Computing thresholds for {MODEL_REGISTRY[model_key]} …")
         ch_thresholds = {}
 
-        for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
+        for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
             if model_key == "sarima":
-                from semg_pipeline.models.sarima_model import SARIMAModel
+                from kinetics_pipeline.models.sarima_model import SARIMAModel
                 errors = model_or_list.score(train_windows)[:, ch_idx]
             else:
                 ch_windows = train_windows[:, :, ch_idx : ch_idx + 1]
@@ -386,10 +249,7 @@ def compute_train_thresholds(
     return thresholds
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 5: Score test set with anomaly injection
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Scoring test helper
 def score_test_trial(
     base_dir: str,
     subject: str,
@@ -399,12 +259,20 @@ def score_test_trial(
     thresholds: Dict[str, Dict[str, float]],
     output_dir: str,
 ) -> None:
-    """
-    Score one test trial for all active models.
-    Generates clean + anomalous windows, scores each, saves output CSVs.
-    """
-    _, windows, meta = _process_trial(base_dir, subject, movement, scaling_params)
-    if windows is None or len(windows) == 0:
+    dataset = SIATGaitDataset(
+        base_dir=base_dir,
+        subjects=[subject],
+        movements=[movement],
+        window_size=WINDOW_SIZE,
+        overlap_size=OVERLAP_SIZE,
+        target_fs=TARGET_FS,
+        scaling_params=scaling_params,
+        fit_scaling=False
+    )
+    windows = dataset.windows_data
+    meta = dataset.windows_metadata
+
+    if len(windows) == 0:
         logger.warning(f"  [test] {subject}/{movement}: no windows — skipping.")
         return
 
@@ -417,7 +285,7 @@ def score_test_trial(
         all_rows: List[Dict] = []
 
         # ── A) Clean windows ─────────────────────────────────────────────────
-        for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
+        for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
             th = thresholds[model_key][ch_name]
 
             if model_key == "sarima":
@@ -436,20 +304,17 @@ def score_test_trial(
             all_rows.extend(rows)
 
         # ── B) Anomalous windows ─────────────────────────────────────────────
-        # Apply each anomaly condition to each clean window independently
         for cond_idx, (inject_fn, inject_kwargs, atype, severity_label) in enumerate(ANOMALY_CONDITIONS):
-            # Build anomalous version of every window for every channel
-            # Shape: (n_windows, WINDOW_SIZE, 9)
             anom_windows = np.empty_like(windows)
             for w_idx in range(n_windows):
-                for ch_idx in range(len(SEMG_CHANNELS)):
+                for ch_idx in range(len(SIGNAL_COLUMNS)):
                     sig = windows[w_idx, :, ch_idx]
                     anom_sig, _ = inject_fn(sig, **inject_kwargs)
                     anom_windows[w_idx, :, ch_idx] = anom_sig
 
             window_id_offset = n_windows * (cond_idx + 1)
 
-            for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
+            for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
                 th = thresholds[model_key][ch_name]
 
                 if model_key == "sarima":
@@ -474,7 +339,6 @@ def score_test_trial(
         )
         out_df = pd.DataFrame(all_rows)
 
-        # Ensure exact column order
         col_order = [
             "subject_id", "modality", "channel_name", "movement", "window_id",
             "window_start_time", "window_end_time", "reconstruction_error",
@@ -488,21 +352,15 @@ def score_test_trial(
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 6: Evaluation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_evaluation(output_dir: str, active_model_keys: List[str]) -> None:
-    """Load all test output CSVs and compute evaluation metrics."""
+def run_evaluation(output_dir: str, active_model_keys: List[str], test_subs: List[str]) -> None:
     logger.info("\n[Evaluation] Loading test score CSVs …")
-
     all_results: Dict[str, pd.DataFrame] = {}
 
     for model_key in active_model_keys:
         model_display = MODEL_REGISTRY[model_key]
         dfs = []
 
-        for sub in TEST_SUBS:
+        for sub in test_subs:
             sub_dir = os.path.join(output_dir, sub)
             if not os.path.isdir(sub_dir):
                 continue
@@ -524,41 +382,36 @@ def run_evaluation(output_dir: str, active_model_keys: List[str]) -> None:
 
         print_evaluation_summary({model_display: per_channel})
 
-    # Save combined report
     summary_path = save_evaluation_report(all_results, output_dir)
     logger.info(f"\n[Evaluation] Summary saved → {summary_path}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="sEMG anomaly detection pipeline (SIAT-LLMD)"
+        description="Kinematics + Kinetics anomaly detection pipeline (SIAT-LLMD)"
     )
     parser.add_argument(
         "--base_dir",
         default=os.path.join("SIAT_LLMD20230404", "SIAT_LLMD20230404"),
-        help="Root path of the SIAT-LLMD dataset (default: SIAT_LLMD20230404/SIAT_LLMD20230404)",
+        help="Root path of the SIAT-LLMD dataset",
     )
     parser.add_argument(
         "--output_dir",
-        default=os.path.join("outputs", "semg"),
-        help="Root output directory (default: outputs/semg)",
+        default=os.path.join("outputs", "kinetics"),
+        help="Root output directory",
     )
     parser.add_argument(
         "--movements",
         nargs="+",
         default=MOVEMENTS,
-        help="Movement codes to process (default: all 16)",
+        help="Movement codes to process",
     )
     parser.add_argument(
         "--models",
         nargs="+",
         default=["lstm", "transformer", "sarima"],
         choices=list(MODEL_REGISTRY.keys()),
-        help="Models to run (default: lstm transformer sarima)",
+        help="Models to run",
     )
     parser.add_argument(
         "--skip_training",
@@ -574,12 +427,12 @@ def parse_args() -> argparse.Namespace:
         "--sarima_max_subjects",
         type=int,
         default=5,
-        help="Number of train subjects to use for SARIMA fitting (default: 5).",
+        help="Number of train subjects to use for SARIMA fitting",
     )
     parser.add_argument(
         "--dry_run",
         action="store_true",
-        help="Process only Sub01 (train), Sub31 (val), Sub36 (test) for smoke-testing.",
+        help="Process reduced subject list for smoke-testing.",
     )
     return parser.parse_args()
 
@@ -589,7 +442,7 @@ def main() -> None:
     t0   = time.time()
 
     logger.info("=" * 65)
-    logger.info("  sEMG Anomaly Detection Pipeline — SIAT-LLMD")
+    logger.info("  Kinematics + Kinetics Anomaly Detection Pipeline")
     logger.info("=" * 65)
     logger.info(f"  base_dir   : {args.base_dir}")
     logger.info(f"  output_dir : {args.output_dir}")
@@ -600,7 +453,6 @@ def main() -> None:
     model_dir = os.path.join(args.output_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
 
-    # ── Dry-run: limit subjects ────────────────────────────────────────────
     if args.dry_run:
         train_subs = ["Sub01", "Sub02"]
         val_subs   = ["Sub31"]
@@ -617,46 +469,55 @@ def main() -> None:
     # TRAIN PHASE
     # ══════════════════════════════════════════════════════════════════════
     if not args.skip_scoring:
-
-        # ── 1. Fit scaler on raw filtered training data ────────────────────
+        # ── 1. Fit/Load scaler using SIATGaitDataset ──
         if os.path.exists(scaler_path) and args.skip_training:
             logger.info(f"[Scaler] Loading existing scaler from {scaler_path}")
             scaling_params = load_scaler(scaler_path)
         else:
-            logger.info("[Scaler] Collecting raw training data to fit scaler …")
-            raw_train_dfs = []
-            for sub in train_subs:
-                for mov in args.movements:
-                    df, _, _ = _process_trial(
-                        args.base_dir, sub, mov,
-                        scaling_params=None,
-                        filter_only=True,
-                    )
-                    if df is not None and not df.empty:
-                        raw_train_dfs.append(df)
-
-            if not raw_train_dfs:
-                logger.error("No training data found. Check --base_dir.")
-                sys.exit(1)
-
-            scaling_params = fit_scaler(raw_train_dfs)
+            logger.info("[Scaler] Fitting scaler on train subjects …")
+            train_dataset = SIATGaitDataset(
+                base_dir=args.base_dir,
+                subjects=train_subs,
+                movements=args.movements,
+                window_size=WINDOW_SIZE,
+                overlap_size=OVERLAP_SIZE,
+                target_fs=TARGET_FS,
+                fit_scaling=True
+            )
+            scaling_params = train_dataset.scaling_params
             save_scaler(scaling_params, scaler_path)
-            logger.info(f"[Scaler] Fitted and saved → {scaler_path}")
+            logger.info(f"[Scaler] Saved scaler params → {scaler_path}")
 
-        # ── 2. Collect train + val windows ────────────────────────────────
+        # ── 2. Collect train + val windows ──
         logger.info("\n[Windows] Collecting training windows …")
-        train_windows, train_meta = collect_split_windows(
-            args.base_dir, train_subs, args.movements, scaling_params, "train"
+        train_dataset = SIATGaitDataset(
+            base_dir=args.base_dir,
+            subjects=train_subs,
+            movements=args.movements,
+            window_size=WINDOW_SIZE,
+            overlap_size=OVERLAP_SIZE,
+            target_fs=TARGET_FS,
+            scaling_params=scaling_params,
+            fit_scaling=False
         )
+        train_windows = train_dataset.windows_data
         logger.info(f"  Train windows: {len(train_windows)}")
 
         logger.info("[Windows] Collecting validation windows …")
-        val_windows, val_meta = collect_split_windows(
-            args.base_dir, val_subs, args.movements, scaling_params, "val"
+        val_dataset = SIATGaitDataset(
+            base_dir=args.base_dir,
+            subjects=val_subs,
+            movements=args.movements,
+            window_size=WINDOW_SIZE,
+            overlap_size=OVERLAP_SIZE,
+            target_fs=TARGET_FS,
+            scaling_params=scaling_params,
+            fit_scaling=False
         )
+        val_windows = val_dataset.windows_data
         logger.info(f"  Val windows: {len(val_windows)}")
 
-        # ── 3. Train or load models ────────────────────────────────────────
+        # ── 3. Train or load models ──
         active_models: Dict[str, object] = {}
 
         for model_key in args.models:
@@ -686,11 +547,11 @@ def main() -> None:
                         train_windows, model_dir, args.sarima_max_subjects
                     )
 
-        # ── 4. Compute thresholds on train set ────────────────────────────
+        # ── 4. Compute thresholds on train set ──
         logger.info("\n[Thresholds] Computing anomaly thresholds from train errors …")
         thresholds = compute_train_thresholds(active_models, train_windows)
 
-        # ── 5. Score test set ─────────────────────────────────────────────
+        # ── 5. Score test set ──
         logger.info("\n[Test] Scoring test subjects …")
         n_test = len(test_subs) * len(args.movements)
         done = 0
@@ -710,7 +571,7 @@ def main() -> None:
     # EVALUATION PHASE
     # ══════════════════════════════════════════════════════════════════════
     logger.info("\n[Evaluation] Running metrics …")
-    run_evaluation(args.output_dir, args.models)
+    run_evaluation(args.output_dir, args.models, test_subs)
 
     elapsed = time.time() - t0
     logger.info(f"\n✓ Pipeline complete in {elapsed/60:.1f} min")
