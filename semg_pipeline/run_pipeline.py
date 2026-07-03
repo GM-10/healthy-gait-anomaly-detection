@@ -56,8 +56,10 @@ import logging
 import os
 import sys
 import time
-from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from semg_pipeline.models.sarima_model import SARIMAModel
 
 import numpy as np
 import pandas as pd
@@ -84,7 +86,6 @@ from semg_pipeline.anomaly_scorer import (
     compute_threshold,
     label_windows,
     build_output_rows,
-    score_and_build_rows,
 )
 from semg_pipeline.evaluator import (
     evaluate_model,
@@ -100,7 +101,6 @@ from utils.synthetic_anomalies import (
     inject_time_shift,
     inject_combined,
     DEFAULT_SEVERITIES,
-    ANOMALY_TYPES,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,7 +280,7 @@ def _train_lstm(
         rng        = np.random.default_rng(42)
         indices    = rng.choice(len(train_windows), size=n_keep, replace=False)
         indices.sort()
-        n_total = len(train_windows)   # capture before reassignment
+        n_total = len(train_windows)
         train_windows = train_windows[indices]
         logger.info(
             f"[LSTM] --max_subjects={max_subjects}: "

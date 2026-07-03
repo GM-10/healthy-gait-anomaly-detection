@@ -18,7 +18,16 @@ This repository contains the official codebase and scientific documentation for 
 │       │   └── Labels/           # Sub##_[MOV]_Label.csv (Time, Status, Group)
 │       └── SubjectInformation.xlsx
 │
-├── semg_pipeline/                # ★ sEMG modality pipeline (this work)
+├── preprocessing/                # Shared Kinematics & Kinetics Preprocessing
+│   ├── __init__.py
+│   ├── loader.py                 # Metadata loading, CSV parsing, torque normalization
+│   ├── inspector.py              # NaN/Inf tracking, IQR outlier detection
+│   ├── cleaner.py                # Cycle alignment, cubic spline interpolation
+│   ├── conditioner.py            # Butterworth filtering, downsampling, min-max scaling
+│   ├── windower.py               # Sliding window segmentation within cycle bounds
+│   └── dataset.py                # PyTorch Dataset wrappers and split generators
+│
+├── semg_pipeline/                # sEMG Modality Pipeline
 │   ├── __init__.py               # Public API exports
 │   ├── loader.py                 # sEMG column loading + label-convention detection
 │   ├── filter.py                 # Notch → Bandpass → Rectify → Envelope chain
@@ -32,24 +41,33 @@ This repository contains the official codebase and scientific documentation for 
 │       ├── lstm_model.py         # PyTorch LSTM Autoencoder per channel
 │       └── transformer_model.py  # PyTorch Transformer Autoencoder per channel
 │
-├── preprocessing/                # Kinematics/kinetics pipeline (teammate)
+├── kinetics_pipeline/            # Kinematics + Kinetics Modality Pipeline
 │   ├── __init__.py
-│   ├── loader.py                 # Metadata loading, CSV parsing, torque normalization
-│   ├── inspector.py              # NaN/Inf tracking, IQR outlier detection
-│   ├── cleaner.py                # Cycle alignment, cubic spline interpolation
-│   ├── conditioner.py            # Butterworth filtering, downsampling, min-max scaling
-│   ├── windower.py               # Sliding window segmentation within cycle bounds
-│   └── dataset.py                # PyTorch Dataset wrappers and split generators
+│   ├── anomaly_scorer.py         # μ+3σ threshold + 12-column output CSV builder
+│   ├── evaluator.py              # Recall, F1, RMSE, confusion matrix
+│   ├── run_pipeline.py           # Master orchestration script
+│   └── models/
+│       ├── sarima_model.py       # pmdarima auto_arima per channel
+│       ├── lstm_model.py         # PyTorch LSTM Autoencoder per channel
+│       └── transformer_model.py  # PyTorch Transformer Autoencoder per channel
+│
+├── fusion/                       # Multimodal Late Fusion Modality Package
+│   └── __init__.py
+│
+├── notebooks/                    # Experimental / analysis notebooks
 │
 ├── utils/
 │   └── synthetic_anomalies.py    # Shared anomaly injection module (both pipelines)
 │
 ├── outputs/                      # Generated at runtime (ignored by Git)
-│   └── sEMG/
-│       ├── scaler_params.json    # Fitted MinMax params (train subjects only)
-│       ├── models/               # Saved model weights & SARIMA pickles
-│       ├── Sub36/ ... Sub40/     # Per-subject output CSVs
-│       └── evaluation_summary.csv
+│   ├── semg/                     # sEMG pipeline output CSVs and summaries
+│   ├── kinetics/                 # Kinematics/Kinetics pipeline output CSVs and summaries
+│   ├── fusion/                   # Late fusion outputs
+│   ├── checkpoints/              # Saved model checkpoints and weights
+│   ├── figures/                  # Plotted analysis figures
+│   └── logs/                     # Script output logs
+│
+├── config/                       # Pipeline parameters and hyperparameter files
 │
 ├── docs/                         # Scientific & engineering documentation
 │   ├── dataset_summary.md        # Conventions, channel names, label codes, file specs
@@ -60,6 +78,14 @@ This repository contains the official codebase and scientific documentation for 
 ├── .gitignore
 └── README.md
 ```
+
+## 📦 Package Responsibilities
+
+* **`preprocessing/`**: Implements the shared joint signal cleaning, filtering, downsampling to 120 Hz, Min-Max scaling, and cyclic window generation for joint angles and joint torques. Reused by both pipelines.
+* **`semg_pipeline/`**: Dedicated pipeline for the sEMG modality. Processes raw high-frequency sEMG signals (1920 Hz), trains models (SARIMA, LSTM, Transformer), and scores reconstructions to label anomalies.
+* **`kinetics_pipeline/`**: Dedicated pipeline for the Kinematics + Kinetics modality. Utilizes downsampled signals (120 Hz) loaded from the shared `preprocessing` package to train models, score reconstructions, and evaluate anomaly detection performance.
+* **`fusion/`**: Combines the output anomaly scores of the sEMG and kinematics+kinetics pipelines in a late-fusion stage to improve final multimodal anomaly detection accuracy.
+
 
 ---
 
