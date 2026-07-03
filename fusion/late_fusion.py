@@ -122,43 +122,76 @@ def _load_subject_csv(
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def load_all_scores(
-    output_dir: str,
+def _load_one_modality(
+    root_dir: str,
     model_display: str,
+    expected_modality: str,
 ) -> pd.DataFrame:
     """
-    Walk output_dir/Sub##/ directories and load all score CSVs for
-    the given model. Returns a single concatenated DataFrame.
+    Walk root_dir/Sub##/ directories, load all *_[model_display]_scores.csv
+    files, and return a single concatenated DataFrame.
+
+    Every loaded row has its `modality` column overwritten with
+    `expected_modality` so the caller can trust the value regardless of
+    what the individual pipeline wrote.
     """
     all_dfs = []
 
+    if not os.path.isdir(root_dir):
+        logger.warning(f"  Directory not found: {root_dir}")
+        return pd.DataFrame()
+
     sub_dirs = sorted([
-        d for d in os.listdir(output_dir)
-        if d.startswith("Sub") and os.path.isdir(os.path.join(output_dir, d))
+        d for d in os.listdir(root_dir)
+        if d.startswith("Sub") and os.path.isdir(os.path.join(root_dir, d))
     ])
 
     if not sub_dirs:
-        logger.error(f"No Sub## directories found in {output_dir}")
+        logger.warning(f"  No Sub## directories found in {root_dir}")
         return pd.DataFrame()
 
     for sub in sub_dirs:
-        logger.info(f"  Loading {sub} / {model_display} …")
-        sub_dir = os.path.join(output_dir, sub)
+        logger.info(f"  [{expected_modality}] Loading {sub} / {model_display} …")
+        sub_dir = os.path.join(root_dir, sub)
         df = _load_subject_csv(sub_dir, model_display)
         if not df.empty:
+            # Enforce the modality label — guards against pipeline mismatches
+            df["modality"] = expected_modality
             all_dfs.append(df)
         else:
-            logger.warning(f"  {sub}: no {model_display} score CSVs found — skipping.")
+            logger.warning(
+                f"  [{expected_modality}] {sub}: no {model_display} score CSVs — skipping."
+            )
 
     if not all_dfs:
         return pd.DataFrame()
 
     combined = pd.concat(all_dfs, ignore_index=True)
     logger.info(
-        f"Loaded {len(combined):,} rows for model={model_display} "
-        f"across {len(sub_dirs)} subjects."
+        f"  [{expected_modality}] Loaded {len(combined):,} rows "
+        f"from {len(all_dfs)}/{len(sub_dirs)} subjects."
     )
     return combined
+
+
+def load_all_scores(
+    semg_dir: str,
+    kinkin_dir: str,
+    model_display: str,
+) -> pd.DataFrame:
+    """
+    Load sEMG scores from `semg_dir/Sub##/` and Kinematics+Kinetics scores
+    from `kinkin_dir/Sub##/`, stamp the correct modality label on each,
+    then concatenate into a single DataFrame ready for fusion.
+    """
+    semg_df   = _load_one_modality(semg_dir,   model_display, MODALITY_SEMG)
+    kinkin_df = _load_one_modality(kinkin_dir, model_display, MODALITY_KINKIN)
+
+    if semg_df.empty and kinkin_df.empty:
+        return pd.DataFrame()
+
+    parts = [df for df in [semg_df, kinkin_df] if not df.empty]
+    return pd.concat(parts, ignore_index=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -451,33 +484,48 @@ def _is_nan(v) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Late fusion of sEMG and Kinematics/Kinetics anomaly scores"
+        description="Late fusion of sEMG and Kinematics/Kinetics anomaly scores",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--semg_dir",
+        default=os.path.join("outputs", "sEMG"),
+        help="Directory containing sEMG pipeline outputs (Sub## subdirs inside)",
+    )
+    parser.add_argument(
+        "--kinkin_dir",
+        default=os.path.join("outputs"),
+        help="Directory containing Kinematics/Kinetics pipeline outputs (Sub## subdirs inside)",
     )
     parser.add_argument(
         "--output_dir",
         default=os.path.join("outputs"),
-        help="Root outputs directory containing Sub## subdirectories (default: outputs/)",
+        help="Root directory where fusion/ output folder will be created",
     )
     parser.add_argument(
         "--model",
         nargs="+",
         default=["lstm", "transformer"],
         choices=["lstm", "transformer"],
-        help="Models to fuse (default: lstm transformer)",
+        help="Models to fuse",
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    args      = parse_args()
-    out_root  = args.output_dir
-    models    = args.model
+    args       = parse_args()
+    semg_dir   = args.semg_dir
+    kinkin_dir = args.kinkin_dir
+    out_root   = args.output_dir
+    models     = args.model
     fusion_dir = os.path.join(out_root, "fusion")
     os.makedirs(fusion_dir, exist_ok=True)
 
     logger.info("=" * 60)
     logger.info("  Late Fusion — sEMG ⊕ Kinematics/Kinetics")
     logger.info("=" * 60)
+    logger.info(f"  semg_dir   : {semg_dir}")
+    logger.info(f"  kinkin_dir : {kinkin_dir}")
     logger.info(f"  output_dir : {out_root}")
     logger.info(f"  models     : {models}")
 
@@ -489,9 +537,9 @@ def main() -> None:
         logger.info(f"  Model: {model_display}")
         logger.info(f"{'─'*55}")
 
-        # ── 1. Load all score CSVs ─────────────────────────────────────────
+        # ── 1. Load from each modality's directory separately ──────────────
         logger.info(f"[Load] Reading {model_display} score CSVs …")
-        raw_df = load_all_scores(out_root, model_display)
+        raw_df = load_all_scores(semg_dir, kinkin_dir, model_display)
 
         if raw_df.empty:
             logger.warning(f"  No data found for {model_display}. Skipping.")
