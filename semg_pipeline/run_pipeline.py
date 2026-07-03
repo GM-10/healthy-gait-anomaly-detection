@@ -268,8 +268,25 @@ def _train_lstm(
     train_windows: np.ndarray,
     val_windows: np.ndarray,
     model_dir: str,
+    max_subjects: Optional[int] = None,
 ) -> List:
     from semg_pipeline.models.lstm_model import LSTMModel
+
+    # Optionally subsample training windows to simulate using only
+    # max_subjects out of 30 train subjects (proportional window count).
+    if max_subjects is not None and max_subjects < len(TRAIN_SUBS):
+        ratio      = max_subjects / len(TRAIN_SUBS)
+        n_keep     = max(1, int(round(len(train_windows) * ratio)))
+        rng        = np.random.default_rng(42)
+        indices    = rng.choice(len(train_windows), size=n_keep, replace=False)
+        indices.sort()
+        n_total = len(train_windows)   # capture before reassignment
+        train_windows = train_windows[indices]
+        logger.info(
+            f"[LSTM] --max_subjects={max_subjects}: "
+            f"using {n_keep}/{n_total} windows "
+            f"(~{max_subjects}/{len(TRAIN_SUBS)} subjects)."
+        )
 
     models = []
     for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
@@ -577,6 +594,17 @@ def parse_args() -> argparse.Namespace:
         help="Number of train subjects to use for SARIMA fitting (default: 5).",
     )
     parser.add_argument(
+        "--max_subjects",
+        type=int,
+        default=None,
+        help=(
+            "Limit LSTM (and Transformer) training to a proportional subset of "
+            "windows equivalent to N subjects out of 30. "
+            "Useful for quick experiments (e.g. --max_subjects 5). "
+            "Default: None (use all 30 train subjects)."
+        ),
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Process only Sub01 (train), Sub31 (val), Sub36 (test) for smoke-testing.",
@@ -591,11 +619,13 @@ def main() -> None:
     logger.info("=" * 65)
     logger.info("  sEMG Anomaly Detection Pipeline — SIAT-LLMD")
     logger.info("=" * 65)
-    logger.info(f"  base_dir   : {args.base_dir}")
-    logger.info(f"  output_dir : {args.output_dir}")
-    logger.info(f"  movements  : {args.movements}")
-    logger.info(f"  models     : {args.models}")
-    logger.info(f"  dry_run    : {args.dry_run}")
+    logger.info(f"  base_dir        : {args.base_dir}")
+    logger.info(f"  output_dir      : {args.output_dir}")
+    logger.info(f"  movements       : {args.movements}")
+    logger.info(f"  models          : {args.models}")
+    logger.info(f"  max_subjects    : {args.max_subjects or 'all (30)'}")
+    logger.info(f"  sarima_max_subs : {args.sarima_max_subjects}")
+    logger.info(f"  dry_run         : {args.dry_run}")
 
     model_dir = os.path.join(args.output_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
@@ -675,7 +705,8 @@ def main() -> None:
             else:
                 if model_key == "lstm":
                     active_models["lstm"] = _train_lstm(
-                        train_windows, val_windows, model_dir
+                        train_windows, val_windows, model_dir,
+                        max_subjects=args.max_subjects,
                     )
                 elif model_key == "transformer":
                     active_models["transformer"] = _train_transformer(
