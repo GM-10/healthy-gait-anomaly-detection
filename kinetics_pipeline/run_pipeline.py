@@ -88,20 +88,36 @@ MODEL_REGISTRY = {
 }
 
 
-def _build_anomaly_conditions():
-    conditions = []
+def _build_anomaly_conditions(
+    severity_levels: List[str],
+) -> List[Tuple]:
+    """
+    Build the list of (inject_fn, kwargs, atype, level) tuples for the
+    requested severity levels.
+
+    Parameters
+    ----------
+    severity_levels : list of str
+        Subset of DEFAULT_SEVERITIES keys to include, e.g. ['mild', 'moderate'].
+
+    Returns
+    -------
+    List of tuples — one per (inject_fn, severity) combination, plus one
+    combined-anomaly entry at moderate severity.
+    """
     inject_fns = [
         (inject_amplitude_scale, "amplitude_scale"),
         (inject_time_warp,       "time_warp"),
         (inject_time_shift,      "time_shift"),
     ]
+    conditions: List[Tuple] = []
     for fn, atype in inject_fns:
-        for level, sev in DEFAULT_SEVERITIES.items():
+        for level in severity_levels:
+            sev = DEFAULT_SEVERITIES[level]
             conditions.append((fn, {"severity": sev}, atype, level))
+    # Combined anomaly always uses moderate regardless of selected levels
     conditions.append((inject_combined, {}, "combined", "moderate"))
     return conditions
-
-ANOMALY_CONDITIONS = _build_anomaly_conditions()
 
 
 # Scaler serialization helpers
@@ -258,7 +274,21 @@ def score_test_trial(
     active_models: Dict[str, object],
     thresholds: Dict[str, Dict[str, float]],
     output_dir: str,
+    anomaly_conditions: List[Tuple],
+    severity_tag: str = "",
 ) -> None:
+    """
+    Score one test trial for all active models.
+
+    Parameters
+    ----------
+    anomaly_conditions : list of (inject_fn, kwargs, atype, severity_label)
+        Built by _build_anomaly_conditions() for the requested severity levels.
+    severity_tag : str
+        Inserted into the output filename before '_scores.csv' when non-empty.
+        e.g. 'mild' -> Sub36_WAK_LSTM_mild_scores.csv
+        Empty string -> Sub36_WAK_LSTM_scores.csv  (default / backward-compat)
+    """
     dataset = SIATGaitDataset(
         base_dir=base_dir,
         subjects=[subject],
@@ -304,7 +334,7 @@ def score_test_trial(
             all_rows.extend(rows)
 
         # ── B) Anomalous windows ─────────────────────────────────────────────
-        for cond_idx, (inject_fn, inject_kwargs, atype, severity_label) in enumerate(ANOMALY_CONDITIONS):
+        for cond_idx, (inject_fn, inject_kwargs, atype, severity_label) in enumerate(anomaly_conditions):
             anom_windows = np.empty_like(windows)
             for w_idx in range(n_windows):
                 for ch_idx in range(len(SIGNAL_COLUMNS)):
@@ -334,8 +364,9 @@ def score_test_trial(
                 all_rows.extend(rows)
 
         # ── Save output CSV ───────────────────────────────────────────────────
+        sev_part = f"_{severity_tag}" if severity_tag else ""
         out_path = os.path.join(
-            sub_out_dir, f"{subject}_{movement}_{model_display}_scores.csv"
+            sub_out_dir, f"{subject}_{movement}_{model_display}{sev_part}_scores.csv"
         )
         out_df = pd.DataFrame(all_rows)
 
@@ -435,6 +466,17 @@ def parse_args() -> argparse.Namespace:
         help="Process reduced subject list for smoke-testing.",
     )
     parser.add_argument(
+        "--severities",
+        nargs="+",
+        default=["moderate"],
+        choices=["mild", "moderate", "severe", "all"],
+        help=(
+            "Severity levels for synthetic anomaly injection. "
+            "Use 'all' to run mild (0.15), moderate (0.35), and severe (0.60). "
+            "Default: moderate only (backward-compatible)."
+        ),
+    )
+    parser.add_argument(
         "--subjects",
         nargs="+",
         default=None,
@@ -472,6 +514,7 @@ def main() -> None:
     logger.info(f"  output_dir : {args.output_dir}")
     logger.info(f"  movements  : {args.movements}")
     logger.info(f"  models     : {args.models}")
+    logger.info(f"  severities : {args.severities}")
     logger.info(f"  dry_run    : {args.dry_run}")
     logger.info(f"  window_size: {WINDOW_SIZE}")
     logger.info(f"  overlap    : {OVERLAP_SIZE}")
@@ -495,6 +538,20 @@ def main() -> None:
         test_subs  = TEST_SUBS
 
     scaler_path = os.path.join(args.output_dir, "scaler_params.json")
+
+    # ── Resolve severity levels ────────────────────────────────────────────
+    requested_sevs = args.severities
+    if "all" in requested_sevs:
+        severity_levels = ["mild", "moderate", "severe"]
+    else:
+        severity_levels = requested_sevs
+    severity_tag = severity_levels[0] if severity_levels != ["moderate"] else ""
+    anomaly_conditions = _build_anomaly_conditions(severity_levels)
+    logger.info(
+        f"[Severities] Running: {severity_levels}  "
+        f"→ {len(anomaly_conditions)} anomaly conditions per window  "
+        f"(filename tag: '{severity_tag or 'none (moderate default)'}')"
+    )
 
     # ══════════════════════════════════════════════════════════════════════
     # TRAIN PHASE
@@ -596,6 +653,8 @@ def main() -> None:
                     active_models,
                     thresholds,
                     args.output_dir,
+                    anomaly_conditions=anomaly_conditions,
+                    severity_tag=severity_tag,
                 )
 
     # ══════════════════════════════════════════════════════════════════════
