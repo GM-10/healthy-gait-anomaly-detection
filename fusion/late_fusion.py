@@ -285,9 +285,28 @@ def _apply_fusion(
     )
 
     if merged.empty:
+        # ── DEBUG 5: explain why the join produced nothing ─────────────────
+        semg_keys   = set(zip(semg_df["subject_id"],   semg_df["movement"],   semg_df["window_id"]))
+        kinkin_keys = set(zip(kinkin_df["subject_id"], kinkin_df["movement"], kinkin_df["window_id"]))
+        n_semg_win   = len(semg_keys)
+        n_kinkin_win = len(kinkin_keys)
+        n_overlap    = len(semg_keys & kinkin_keys)
         logger.warning(
-            f"  [{model_display}] No windows matched between modalities "
-            "(check subject_id / window_id alignment)."
+            f"[DEBUG] [{model_display}] Inner join returned 0 rows.\n"
+            f"        sEMG   has {n_semg_win:,} unique (subject, movement, window_id) keys.\n"
+            f"        Kin/Kin has {n_kinkin_win:,} unique (subject, movement, window_id) keys.\n"
+            f"        Overlap (matching keys): {n_overlap:,}\n"
+            f"        Possible causes:\n"
+            f"          • Both pipelines processed different subjects — check test subject lists.\n"
+            f"          • window_id values differ between pipelines (e.g. one is 0-indexed, "
+            f"the other is offset-based). Inspect sample window_id values below:\n"
+            f"            sEMG    window_ids (first 5): "
+            f"{sorted(semg_df['window_id'].unique())[:5]}\n"
+            f"            Kin/Kin window_ids (first 5): "
+            f"{sorted(kinkin_df['window_id'].unique())[:5]}\n"
+            f"          • movement strings differ (e.g. 'WAK' vs 'wak'). "
+            f"sEMG movements: {sorted(semg_df['movement'].unique())[:5]}  "
+            f"Kin/Kin movements: {sorted(kinkin_df['movement'].unique())[:5]}"
         )
         return pd.DataFrame()
 
@@ -309,6 +328,16 @@ def _apply_fusion(
     merged["fused_AND"] = (
         (merged["semg_vote"] == 1) & (merged["kinkin_vote"] == 1)
     ).astype(int)
+
+    # ── DEBUG 4: rows surviving the inner join ─────────────────────────────
+    n_semg_pre   = len(semg_df)
+    n_kinkin_pre = len(kinkin_df)
+    logger.info(
+        f"[DEBUG] [{model_display}] Inner join: "
+        f"{n_semg_pre:,} sEMG windows + {n_kinkin_pre:,} Kin/Kin windows "
+        f"→ {len(merged):,} matched windows after inner join on "
+        f"(subject_id, movement, window_id)."
+    )
 
     merged["model_name"] = model_display
     logger.info(
@@ -470,7 +499,26 @@ def main() -> None:
 
         # Validate modality values present
         present_modalities = raw_df["modality"].unique().tolist()
-        logger.info(f"  Modalities present: {present_modalities}")
+
+        # ── DEBUG 3: unique modality values ───────────────────────────────
+        logger.info(f"[DEBUG] Unique modality values in loaded data: {present_modalities}")
+
+        # ── DEBUG 1 & 2: per-modality row counts ──────────────────────────
+        semg_rows   = int((raw_df["modality"] == MODALITY_SEMG).sum())
+        kinkin_rows = int((raw_df["modality"] == MODALITY_KINKIN).sum())
+        other_rows  = len(raw_df) - semg_rows - kinkin_rows
+        logger.info(f"[DEBUG] Rows loaded — sEMG: {semg_rows:,}  |  "
+                    f"Kinematics+Kinetics: {kinkin_rows:,}  |  "
+                    f"other/unrecognised: {other_rows:,}")
+        if other_rows > 0:
+            other_vals = raw_df[~raw_df["modality"].isin(
+                [MODALITY_SEMG, MODALITY_KINKIN]
+            )]["modality"].unique().tolist()
+            logger.warning(
+                f"[DEBUG] Unrecognised modality values found: {other_vals}  "
+                "— check that both pipelines write the exact modality strings "
+                f"'{MODALITY_SEMG}' and '{MODALITY_KINKIN}'."
+            )
 
         if MODALITY_SEMG not in present_modalities:
             logger.warning(f"  '{MODALITY_SEMG}' not found — cannot fuse.")
