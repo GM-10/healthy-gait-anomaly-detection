@@ -42,6 +42,8 @@ from kinetics_pipeline.anomaly_scorer import (
     label_windows,
     build_output_rows,
     score_and_build_rows,
+    save_train_errors,
+    load_train_errors,
 )
 from kinetics_pipeline.evaluator import (
     evaluate_model,
@@ -239,11 +241,24 @@ def _load_sarima_models(model_dir: str) -> "SARIMAModel":
 def compute_train_thresholds(
     active_models: Dict[str, object],
     train_windows: np.ndarray,
+    output_dir: Optional[str] = None,
+    save_errors: bool = False,
 ) -> Dict[str, Dict[str, float]]:
+    """
+    Compute per-model per-channel anomaly thresholds from training windows.
+
+    Optionally saves training errors as .npy files for use by evaluate.py
+    when computing percentile thresholds (--save_train_errors flag).
+
+    Returns
+    -------
+    thresholds[model_key][channel_name] = float threshold
+    """
     thresholds: Dict[str, Dict[str, float]] = {}
 
     for model_key, model_or_list in active_models.items():
-        logger.info(f"[Threshold] Computing thresholds for {MODEL_REGISTRY[model_key]} …")
+        model_display = MODEL_REGISTRY[model_key]
+        logger.info(f"[Threshold] Computing thresholds for {model_display} …")
         ch_thresholds = {}
 
         for ch_idx, ch_name in enumerate(SIGNAL_COLUMNS):
@@ -259,6 +274,10 @@ def compute_train_thresholds(
                 f"  {ch_name}: threshold = {ch_thresholds[ch_name]:.6f} "
                 f"(mean={np.mean(errors):.6f}, std={np.std(errors):.6f})"
             )
+
+            # Persist training errors for evaluate.py multi-threshold support
+            if save_errors and output_dir is not None:
+                save_train_errors(errors, ch_name, model_display, output_dir)
 
         thresholds[model_key] = ch_thresholds
 
@@ -494,6 +513,25 @@ def parse_args() -> argparse.Namespace:
         default=50,
         help="Overlap size in frames",
     )
+    parser.add_argument(
+        "--save_train_errors",
+        action="store_true",
+        help=(
+            "Save per-channel training reconstruction errors as .npy files. "
+            "Required by evaluate.py to compute percentile thresholds without re-inference. "
+            "Files saved to output_dir/train_errors/."
+        ),
+    )
+    parser.add_argument(
+        "--threshold_method",
+        default="mean_std",
+        choices=["mean_std", "percentile95", "percentile99"],
+        help=(
+            "Thresholding method for scoring test windows. "
+            "'mean_std' = mu + 3*sigma (default, backward-compatible). "
+            "Note: evaluate.py re-computes all three methods from saved train errors."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -637,7 +675,11 @@ def main() -> None:
 
         # ── 4. Compute thresholds on train set ──
         logger.info("\n[Thresholds] Computing anomaly thresholds from train errors …")
-        thresholds = compute_train_thresholds(active_models, train_windows)
+        thresholds = compute_train_thresholds(
+            active_models, train_windows,
+            output_dir=args.output_dir,
+            save_errors=getattr(args, "save_train_errors", False),
+        )
 
         # ── 5. Score test set ──
         logger.info("\n[Test] Scoring test subjects …")

@@ -1,0 +1,56 @@
+# configs/lstm.yaml
+# Evaluation configuration for LSTM model experiments.
+# Run with: python evaluate.py --config configs/lstm.yaml
+
+threshold_methods:
+  - mean_std
+  - percentile95
+  - percentile99
+
+models:
+  - lstm
+
+n_bootstrap: 1000
+ci_level: 0.95
+random_seed: 42
+
+output_dir: outputs/evaluation/lstm
+semg_dir: outputs/sEMG
+kinkin_dir: outputs/kinetics
+
+movements:
+  - WAK
+  - UPS
+  - DNS
+  - HS
+  - KLCL
+  - KLFT
+  - LLB
+  - LLF
+  - LLS
+  - LUGB
+  - LUGF
+  - SITDN
+  - STC
+  - STDUP
+  - TO
+  - TPTO
+
+test_subjects:
+  - Sub36
+  - Sub37
+  - Sub38
+  - Sub39
+  - Sub40
+
+severity_levels:
+  - mild
+  - moderate
+  - severe
+
+figure_formats:
+  - png
+  - pdf
+  - svg
+
+dry_run: false

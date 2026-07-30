@@ -86,6 +86,8 @@ from semg_pipeline.anomaly_scorer import (
     compute_threshold,
     label_windows,
     build_output_rows,
+    save_train_errors,
+    load_train_errors,
 )
 from semg_pipeline.evaluator import (
     evaluate_model,
@@ -385,9 +387,14 @@ def _load_sarima_models(model_dir: str) -> "SARIMAModel":
 def compute_train_thresholds(
     active_models: Dict[str, object],
     train_windows: np.ndarray,
+    output_dir: Optional[str] = None,
+    save_errors: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """
     Compute per-model per-channel anomaly thresholds from training windows.
+
+    Optionally saves training errors as .npy files for use by evaluate.py
+    when computing percentile thresholds.
 
     Returns
     -------
@@ -396,7 +403,8 @@ def compute_train_thresholds(
     thresholds: Dict[str, Dict[str, float]] = {}
 
     for model_key, model_or_list in active_models.items():
-        logger.info(f"[Threshold] Computing thresholds for {MODEL_REGISTRY[model_key]} …")
+        model_display = MODEL_REGISTRY[model_key]
+        logger.info(f"[Threshold] Computing thresholds for {model_display} …")
         ch_thresholds = {}
 
         for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
@@ -412,6 +420,10 @@ def compute_train_thresholds(
                 f"  {ch_name}: threshold = {ch_thresholds[ch_name]:.6f} "
                 f"(mean={np.mean(errors):.6f}, std={np.std(errors):.6f})"
             )
+
+            # Persist training errors for evaluate.py multi-threshold support
+            if save_errors and output_dir is not None:
+                save_train_errors(errors, ch_name, model_display, output_dir)
 
         thresholds[model_key] = ch_thresholds
 
@@ -474,7 +486,7 @@ def score_test_trial(
                 meta, errors, preds, ch_name, subject, movement,
                 model_display,
                 is_synthetic_anomaly=0, anomaly_type="none",
-                window_id_offset=0,
+                window_id_offset=0, severity=0.0,
             )
             all_rows.extend(rows)
 
@@ -502,12 +514,19 @@ def score_test_trial(
                     errors = model_or_list[ch_idx].score(ch_win)
 
                 preds = label_windows(errors, th)
+                # Numeric severity value for this condition
+                from utils.synthetic_anomalies import DEFAULT_SEVERITIES
+                sev_numeric = inject_kwargs.get(
+                    "severity",
+                    DEFAULT_SEVERITIES.get(severity_label, 0.35),
+                )
                 rows  = build_output_rows(
                     meta, errors, preds, ch_name, subject, movement,
                     model_display,
                     is_synthetic_anomaly=1,
                     anomaly_type=atype,
                     window_id_offset=window_id_offset,
+                    severity=float(sev_numeric),
                 )
                 all_rows.extend(rows)
 
@@ -518,12 +537,15 @@ def score_test_trial(
         )
         out_df = pd.DataFrame(all_rows)
 
-        # Ensure exact column order
+        # Ensure exact column order (include new columns with fallback)
         col_order = [
             "subject_id", "modality", "channel_name", "movement", "window_id",
             "window_start_time", "window_end_time", "reconstruction_error",
             "is_synthetic_anomaly", "anomaly_type", "predicted_label", "model_name",
+            "severity",
         ]
+        # Only keep columns that exist (backward-compatible)
+        col_order = [c for c in col_order if c in out_df.columns]
         out_df = out_df[col_order]
         out_df.to_csv(out_path, index=False)
         logger.info(
@@ -640,6 +662,26 @@ def parse_args() -> argparse.Namespace:
             "Severity levels for synthetic anomaly injection. "
             "Use 'all' to run mild (0.15), moderate (0.35), and severe (0.60). "
             "Default: moderate only (backward-compatible)."
+        ),
+    )
+    parser.add_argument(
+        "--save_train_errors",
+        action="store_true",
+        help=(
+            "Save per-channel training reconstruction errors as .npy files. "
+            "Required by evaluate.py to compute percentile thresholds without re-inference. "
+            "Files saved to output_dir/train_errors/."
+        ),
+    )
+    parser.add_argument(
+        "--threshold_method",
+        default="mean_std",
+        choices=["mean_std", "percentile95", "percentile99"],
+        help=(
+            "Thresholding method for scoring test windows. "
+            "'mean_std' = mu + 3*sigma (default, backward-compatible). "
+            "'percentile95'/'percentile99' = percentile-based thresholds. "
+            "Note: evaluate.py re-computes all three methods from saved train errors."
         ),
     )
     parser.add_argument(
@@ -773,7 +815,11 @@ def main() -> None:
 
         # ── 4. Compute thresholds on train set ────────────────────────────
         logger.info("\n[Thresholds] Computing anomaly thresholds from train errors …")
-        thresholds = compute_train_thresholds(active_models, train_windows)
+        thresholds = compute_train_thresholds(
+            active_models, train_windows,
+            output_dir=args.output_dir,
+            save_errors=getattr(args, "save_train_errors", False),
+        )
 
         # ── 5. Score test set ─────────────────────────────────────────────
         logger.info("\n[Test] Scoring test subjects …")
