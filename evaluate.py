@@ -527,10 +527,18 @@ def run_evaluation(
 
     # ── Summary ───────────────────────────────────────────────────────────────
     elapsed = time.time() - t0
-    _print_summary(comparison_df, stats_report, severity_report, config, elapsed)
+    _print_summary(
+        comparison_df, stats_report, severity_report, config, elapsed,
+        fusion_report=fusion_report,
+        threshold_comparison_df=threshold_comparison_df,
+    )
 
 
-def _print_summary(comparison_df, stats_report, severity_report, config, elapsed):
+def _print_summary(
+    comparison_df, stats_report, severity_report, config, elapsed,
+    fusion_report=None,
+    threshold_comparison_df=None,
+):
     """Print a concise summary to stdout."""
     logger.info("\n" + "=" * 65)
     logger.info("  EVALUATION COMPLETE")
@@ -539,7 +547,7 @@ def _print_summary(comparison_df, stats_report, severity_report, config, elapsed
     logger.info(f"  Elapsed time     : {elapsed:.1f}s")
     logger.info(f"  Total rows       : {len(comparison_df)}")
 
-    # Best F1 per (model, threshold_method)
+    # 1. Best F1 per (model, threshold_method)
     if not comparison_df.empty and "f1" in comparison_df.columns:
         agg_rows = comparison_df[comparison_df.get("channel_name", pd.Series()) == "ALL_CHANNELS"]
         if agg_rows.empty:
@@ -549,6 +557,51 @@ def _print_summary(comparison_df, stats_report, severity_report, config, elapsed
             best_f1 = grp["f1"].max()
             logger.info(f"    {model:15s}  {method:15s}  F1={best_f1:.4f}")
 
+    # 2. Threshold Agreement & Difference Overview
+    if threshold_comparison_df is not None and not threshold_comparison_df.empty:
+        logger.info("\n  Threshold Agreement & Difference Overview:")
+        for model, grp in threshold_comparison_df.groupby("model_name"):
+            mean_diff_p95 = grp["rel_diff_percentile95_vs_mean_std_pct"].mean()
+            mean_diff_p99 = grp["rel_diff_percentile99_vs_mean_std_pct"].mean()
+            mean_agree = grp["agreement_mean_std_vs_percentile95"].mean()
+            logger.info(
+                f"    {model:15s} | Avg P95 vs mu+3sigma Diff: {mean_diff_p95:+.2f}% | "
+                f"Avg P99 vs mu+3sigma Diff: {mean_diff_p99:+.2f}% | Avg P95 Agreement: {mean_agree*100:.2f}%"
+            )
+
+    # 3. Kruskal-Wallis H-test Severity significance
+    if severity_report is not None and hasattr(severity_report, "kruskal_df") and not severity_report.kruskal_df.empty:
+        logger.info("\n  Kruskal-Wallis Significance (Severity stratification):")
+        for model, grp in severity_report.kruskal_df.groupby("model_name"):
+            n_total = len(grp)
+            n_sig = grp["kruskal_sig"].sum()
+            logger.info(f"    {model:15s} | Significant severity effect on {n_sig} / {n_total} channels")
+
+    # 4. Fusion strategy pairwise significance tests
+    if fusion_report is not None and hasattr(fusion_report, "significance_df") and not fusion_report.significance_df.empty:
+        logger.info("\n  Pairwise Fusion Strategy Statistical Comparisons:")
+        sig_sub = fusion_report.significance_df[
+            (fusion_report.significance_df["strategy_A"].isin(["AND", "MAJORITY"])) &
+            (fusion_report.significance_df["strategy_B"] == "OR")
+        ]
+        for _, row in sig_sub.iterrows():
+            logger.info(
+                f"    {row['model_name']:15s} | {row['strategy_A']:8s} vs {row['strategy_B']:3s} | "
+                f"Delta F1: {row['delta_f1_obs']:+.4f} (p_adj={row['p_f1_bonf']:.4f}) | "
+                f"Delta Recall: {row['delta_recall_obs']:+.4f} (p_adj={row['p_recall_bonf']:.4f})"
+            )
+
+    # 5. OR-fusion dominance decomposition
+    if fusion_report is not None and hasattr(fusion_report, "or_dominance_df") and not fusion_report.or_dominance_df.empty:
+        logger.info("\n  OR-Fusion Recall Dominance Decomposition:")
+        for _, row in fusion_report.or_dominance_df.iterrows():
+            logger.info(
+                f"    {row['model_name']:15s} | Complementarity: {row['complementarity_score']:.4f} | "
+                f"F1 Gain vs Best Single Modality: {row['or_f1_gain_vs_best_single']:+.4f} "
+                f"(Recall Bound Holds: {row['recall_bound_holds']})"
+            )
+
+    # 6. Existing metrics counts
     if stats_report is not None and not stats_report.mcnemar_df.empty:
         n_sig = stats_report.mcnemar_df["mcnemar_sig"].sum()
         logger.info(f"\n  McNemar significant pairs : {n_sig} / {len(stats_report.mcnemar_df)}")
