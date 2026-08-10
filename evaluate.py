@@ -47,7 +47,12 @@ if _REPO_ROOT not in sys.path:
 
 # Framework imports
 from evaluation_framework.config import load_config, EvalConfig
-from evaluation_framework.thresholds import fit_all_thresholds, save_all_thresholds, THRESHOLD_METHODS
+from evaluation_framework.thresholds import (
+    fit_all_thresholds,
+    save_all_thresholds,
+    compare_thresholds,
+    THRESHOLD_METHODS,
+)
 from evaluation_framework.evaluation import (
     evaluate_all_thresholds,
     aggregate_by_modality,
@@ -379,6 +384,13 @@ def run_evaluation(
     )
     save_all_thresholds(threshold_results_map, config.output_dir)
 
+    # ── Step 3b: Threshold comparison table ──────────────────────────────────
+    logger.info("  [3b] Comparing threshold methods (value, rel-diff, label-agreement) …")
+    threshold_comparison_df = compare_thresholds(threshold_results_map, score_df)
+    thresh_comp_csv = os.path.join(config.output_dir, "threshold_comparison.csv")
+    threshold_comparison_df.to_csv(thresh_comp_csv, index=False)
+    logger.info(f"  Threshold comparison → {thresh_comp_csv}")
+
     # ── Step 4: Evaluate all thresholds ──────────────────────────────────────
     logger.info("\n[4/9] Computing metrics for all (model × channel × threshold) …")
     metrics_df = evaluate_all_thresholds(
@@ -423,6 +435,12 @@ def run_evaluation(
     sev_dir = os.path.join(config.output_dir, "severity")
     severity_paths = severity_analyzer.export(severity_report, sev_dir)
     logger.info(f"  Severity analysis → {sev_dir} ({len(severity_paths)} files)")
+
+    # Severity profile plots (line plots with CI error bars)
+    if not skip_plots:
+        severity_analyzer.plot_severity_profiles(
+            severity_report, sev_dir, formats=config.figure_formats
+        )
 
     if not severity_report.cause_df.empty:
         n_nonmono = len(severity_report.cause_df)
@@ -488,6 +506,7 @@ def run_evaluation(
         severity_report=severity_report,
         fusion_report=fusion_report,
         fusion_metrics_df=fusion_metrics_df if not fusion_metrics_df.empty else None,
+        threshold_comparison_df=threshold_comparison_df,
     )
     logger.info(f"  Tables → {tables_dir} ({len(table_paths)} files)")
 

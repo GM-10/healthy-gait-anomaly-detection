@@ -12,12 +12,22 @@ reconstruction errors (healthy windows only):
 Factory function:
     get_threshold(method_name) → ThresholdBase instance
 
+Comparison utility:
+    compare_thresholds(threshold_results, test_scores) → pd.DataFrame
+        Side-by-side comparison of threshold values, relative differences,
+        and per-window label agreement rates across all three methods.
+
 Usage:
-    from evaluation_framework.thresholds import get_threshold
+    from evaluation_framework.thresholds import get_threshold, compare_thresholds
 
     thresh = get_threshold("percentile95")
     result = thresh.fit(train_errors)
     labels = thresh.predict(test_errors)
+
+    comparison_df = compare_thresholds(
+        threshold_results={\"mean_std\": r1, \"percentile95\": r2, \"percentile99\": r3},
+        test_scores=test_errors,
+    )
 """
 
 from __future__ import annotations
@@ -27,7 +37,9 @@ import os
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
+
+import pandas as pd
 
 import numpy as np
 
@@ -329,3 +341,114 @@ def save_all_thresholds(
     with open(out_path, "w") as f:
         json.dump(all_data, f, indent=2)
     logger.info(f"[Thresholds] Saved all threshold results → {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Threshold comparison utility
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compare_thresholds(
+    threshold_results_map: Dict[str, Dict[str, Dict[str, "ThresholdResult"]]],
+    score_df: "pd.DataFrame",
+) -> "pd.DataFrame":
+    """
+    Produce a per-channel comparison table across all fitted threshold methods.
+
+    For every (model_name, channel_name) triple the table shows:
+      - Threshold value for each method (mean_std, percentile95, percentile99)
+      - Relative difference: (Pxx − mean_std) / mean_std × 100%
+      - Label-agreement rate between every pair of methods:
+          agreement = fraction of windows where both methods yield the same label
+      - Number of windows that *flip* label (0→1 or 1→0) when switching methods
+
+    Parameters
+    ----------
+    threshold_results_map : dict
+        Structure: {model_key: {channel_name: {method: ThresholdResult}}}
+        Produced by _compute_all_thresholds() in evaluate.py.
+    score_df : pd.DataFrame
+        Score CSV data; must contain 'model_name', 'channel_name',
+        'reconstruction_error'.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (model_name, channel_name, modality) with comparison columns.
+    """
+    records: List[Dict[str, Any]] = []
+    method_pairs = [
+        ("mean_std", "percentile95"),
+        ("mean_std", "percentile99"),
+        ("percentile95", "percentile99"),
+    ]
+
+    for model_name, ch_map in threshold_results_map.items():
+        model_df = score_df[score_df["model_name"] == model_name] \
+            if "model_name" in score_df.columns else score_df
+
+        for channel_name, method_map in ch_map.items():
+            ch_df = model_df[model_df["channel_name"] == channel_name] \
+                if "channel_name" in model_df.columns else model_df
+
+            errors = ch_df["reconstruction_error"].values.astype(float) \
+                if not ch_df.empty else np.array([])
+            modality = ch_df["modality"].iloc[0] \
+                if (not ch_df.empty and "modality" in ch_df.columns) else "unknown"
+
+            rec: Dict[str, Any] = {
+                "model_name":   model_name,
+                "modality":     modality,
+                "channel_name": channel_name,
+                "n_windows":    len(errors),
+            }
+
+            # Threshold values
+            thresh_values: Dict[str, float] = {}
+            for method, result in method_map.items():
+                thresh_values[method] = result.value
+                rec[f"thresh_{method}"] = round(result.value, 8)
+
+            # Relative differences relative to mean_std
+            baseline = thresh_values.get("mean_std", float("nan"))
+            for method in ["percentile95", "percentile99"]:
+                if method in thresh_values and not np.isnan(baseline) and baseline != 0:
+                    rel_diff = (thresh_values[method] - baseline) / abs(baseline) * 100.0
+                    rec[f"rel_diff_{method}_vs_mean_std_pct"] = round(rel_diff, 4)
+                else:
+                    rec[f"rel_diff_{method}_vs_mean_std_pct"] = float("nan")
+
+            # Pairwise label-agreement rates (requires test scores)
+            if len(errors) > 0:
+                preds: Dict[str, np.ndarray] = {}
+                for method, tv in thresh_values.items():
+                    preds[method] = (errors > tv).astype(int)
+
+                for m_a, m_b in method_pairs:
+                    if m_a in preds and m_b in preds:
+                        agree = float((preds[m_a] == preds[m_b]).mean())
+                        n_flip_01 = int(((preds[m_a] == 0) & (preds[m_b] == 1)).sum())
+                        n_flip_10 = int(((preds[m_a] == 1) & (preds[m_b] == 0)).sum())
+                        rec[f"agreement_{m_a}_vs_{m_b}"] = round(agree, 6)
+                        rec[f"flip_0to1_{m_a}_vs_{m_b}"] = n_flip_01
+                        rec[f"flip_1to0_{m_a}_vs_{m_b}"] = n_flip_10
+                    else:
+                        rec[f"agreement_{m_a}_vs_{m_b}"] = float("nan")
+                        rec[f"flip_0to1_{m_a}_vs_{m_b}"] = 0
+                        rec[f"flip_1to0_{m_a}_vs_{m_b}"] = 0
+            else:
+                for m_a, m_b in method_pairs:
+                    rec[f"agreement_{m_a}_vs_{m_b}"] = float("nan")
+                    rec[f"flip_0to1_{m_a}_vs_{m_b}"] = 0
+                    rec[f"flip_1to0_{m_a}_vs_{m_b}"] = 0
+
+            records.append(rec)
+            logger.debug(
+                f"[ThresholdCompare] {model_name}/{channel_name}: "
+                f"mean_std={thresh_values.get('mean_std', float('nan')):.6f}  "
+                f"P95={thresh_values.get('percentile95', float('nan')):.6f}  "
+                f"P99={thresh_values.get('percentile99', float('nan')):.6f}"
+            )
+
+    df = pd.DataFrame(records)
+    logger.info(f"[ThresholdCompare] Comparison table: {len(df)} rows")
+    return df

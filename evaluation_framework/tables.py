@@ -247,7 +247,7 @@ def generate_statistics_table(stats_report) -> Dict[str, str]:
 
 
 def generate_severity_table(severity_report) -> Dict[str, str]:
-    """Generate severity analysis summary table."""
+    """Generate severity analysis summary table with bootstrap recall CIs."""
     if severity_report.aggregate_df.empty:
         return {"csv": "", "markdown": "", "latex": ""}
 
@@ -255,7 +255,8 @@ def generate_severity_table(severity_report) -> Dict[str, str]:
     display_cols = [
         "model_name", "modality", "anomaly_type", "severity_numeric",
         "threshold_method",
-        "mean_error", "recall", "f1", "threshold_margin",
+        "mean_error", "recall", "recall_ci_lower", "recall_ci_upper",
+        "f1", "threshold_margin",
         "TP", "FN", "n_windows",
     ]
     df = df[[c for c in display_cols if c in df.columns]]
@@ -265,7 +266,7 @@ def generate_severity_table(severity_report) -> Dict[str, str]:
         "markdown": _df_to_markdown(df),
         "latex":    _df_to_latex(
             df,
-            caption="Severity-Stratified Anomaly Detection Analysis",
+            caption="Severity-Stratified Anomaly Detection Analysis (with 95\\% Bootstrap Recall CI)",
             label="tab:severity",
             best_cols=["recall", "f1"],
         ),
@@ -313,6 +314,155 @@ def generate_fusion_table(
     }
 
 
+def generate_threshold_comparison_table(
+    threshold_comparison_df: pd.DataFrame,
+) -> Dict[str, str]:
+    """
+    Generate a per-channel threshold comparison table showing:
+    - Threshold values for each method
+    - Relative differences: (Pxx - mean_std) / mean_std %
+    - Label-agreement rates between method pairs
+    - Label flip counts when switching methods
+    """
+    if threshold_comparison_df is None or threshold_comparison_df.empty:
+        return {"csv": "", "markdown": "", "latex": ""}
+
+    df = threshold_comparison_df.copy()
+
+    # Display column order (include whatever columns exist)
+    preferred_order = [
+        "model_name", "modality", "channel_name", "n_windows",
+        "thresh_mean_std", "thresh_percentile95", "thresh_percentile99",
+        "rel_diff_percentile95_vs_mean_std_pct",
+        "rel_diff_percentile99_vs_mean_std_pct",
+        "agreement_mean_std_vs_percentile95",
+        "agreement_mean_std_vs_percentile99",
+        "agreement_percentile95_vs_percentile99",
+        "flip_0to1_mean_std_vs_percentile95",
+        "flip_1to0_mean_std_vs_percentile95",
+        "flip_0to1_mean_std_vs_percentile99",
+        "flip_1to0_mean_std_vs_percentile99",
+    ]
+    df = df[[c for c in preferred_order if c in df.columns]]
+
+    return {
+        "csv":      df.to_csv(index=False),
+        "markdown": _df_to_markdown(df),
+        "latex":    _df_to_latex(
+            df,
+            caption=r"Threshold Comparison: $\mu+3\sigma$ vs P95 vs P99 "
+                    r"--- Values, Relative Differences, and Label Agreement Rates",
+            label="tab:threshold_comparison",
+            best_cols=["agreement_mean_std_vs_percentile95",
+                       "agreement_mean_std_vs_percentile99"],
+        ),
+    }
+
+
+def generate_kruskal_table(kruskal_df: pd.DataFrame) -> Dict[str, str]:
+    """
+    Generate a Kruskal-Wallis H-test results table (severity significance).
+    """
+    if kruskal_df is None or kruskal_df.empty:
+        return {"csv": "", "markdown": "", "latex": ""}
+
+    df = kruskal_df.copy()
+    display_cols = [
+        "model_name", "modality", "channel_name", "anomaly_type",
+        "kruskal_H", "kruskal_p", "kruskal_sig",
+        "n_severity_levels", "posthoc_mannwhitney_bonferroni",
+    ]
+    df = df[[c for c in display_cols if c in df.columns]]
+
+    return {
+        "csv":      df.to_csv(index=False),
+        "markdown": _df_to_markdown(df),
+        "latex":    _df_to_latex(
+            df,
+            caption="Kruskal-Wallis Test: Reconstruction Error vs Severity Level "
+                    "(with Bonferroni-corrected Mann-Whitney U post-hoc tests)",
+            label="tab:kruskal_wallis",
+            best_cols=[],
+        ),
+    }
+
+
+def generate_fusion_significance_table(
+    significance_df: pd.DataFrame,
+) -> Dict[str, str]:
+    """
+    Generate the pairwise fusion strategy bootstrap + McNemar significance table.
+    """
+    if significance_df is None or significance_df.empty:
+        return {"csv": "", "markdown": "", "latex": ""}
+
+    df = significance_df.copy()
+    display_cols = [
+        "model_name", "strategy_A", "strategy_B",
+        "recall_A", "recall_B", "delta_recall_obs",
+        "delta_recall_ci_lo", "delta_recall_ci_hi",
+        "p_recall_bonf", "sig_recall_bonf",
+        "f1_A", "f1_B", "delta_f1_obs",
+        "delta_f1_ci_lo", "delta_f1_ci_hi",
+        "p_f1_bonf", "sig_f1_bonf",
+        "mcnemar_chi2", "mcnemar_p_bonf", "mcnemar_sig_bonf",
+        "effect_size_d", "n_windows",
+    ]
+    df = df[[c for c in display_cols if c in df.columns]]
+
+    return {
+        "csv":      df.to_csv(index=False),
+        "markdown": _df_to_markdown(df),
+        "latex":    _df_to_latex(
+            df,
+            caption="Pairwise Fusion Strategy Significance Tests "
+                    "(Bootstrap 95\\% CI + McNemar, Bonferroni-corrected, $n=1000$ resamples)",
+            label="tab:fusion_significance",
+            best_cols=[],
+        ),
+    }
+
+
+def generate_or_dominance_table(
+    or_dominance_df: pd.DataFrame,
+) -> Dict[str, str]:
+    """
+    Generate the OR-fusion mathematical dominance decomposition table.
+    """
+    if or_dominance_df is None or or_dominance_df.empty:
+        return {"csv": "", "markdown": "", "latex": ""}
+
+    df = or_dominance_df.copy()
+    display_cols = [
+        "model_name",
+        "recall_semg", "recall_kinkin", "recall_or",
+        "precision_semg", "precision_kinkin", "precision_or",
+        "f1_semg", "f1_kinkin", "f1_or",
+        "recall_lower_bound", "recall_bound_holds",
+        "precision_upper_bound", "precision_penalty_holds",
+        "complementarity_score",
+        "n_only_semg", "n_only_kinkin", "n_both_fire", "n_neither",
+        "extra_tp_from_or", "extra_fp_from_or",
+        "or_f1_exceeds_semg", "or_f1_exceeds_kinkin",
+        "or_f1_exceeds_both_modalities",
+        "best_single_f1", "or_f1_gain_vs_best_single",
+        "n_windows",
+    ]
+    df = df[[c for c in display_cols if c in df.columns]]
+
+    return {
+        "csv":      df.to_csv(index=False),
+        "markdown": _df_to_markdown(df),
+        "latex":    _df_to_latex(
+            df,
+            caption="OR-Fusion Recall Dominance Decomposition: "
+                    "Recall Bound, Precision Penalty, and Modality Complementarity",
+            label="tab:or_dominance",
+            best_cols=["recall_or", "f1_or", "complementarity_score"],
+        ),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Master export
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,6 +474,7 @@ def export_all_tables(
     severity_report=None,
     fusion_report=None,
     fusion_metrics_df: Optional[pd.DataFrame] = None,
+    threshold_comparison_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, str]:
     """
     Generate and write all tables to disk.
@@ -342,6 +493,8 @@ def export_all_tables(
         Output of FusionAnalyzer.analyze().
     fusion_metrics_df : pd.DataFrame, optional
         Output of evaluate_fusion_strategies().
+    threshold_comparison_df : pd.DataFrame, optional
+        Output of compare_thresholds() from thresholds.py.
 
     Returns
     -------
@@ -361,9 +514,21 @@ def export_all_tables(
 
     if severity_report is not None:
         table_specs.append(("severity", generate_severity_table(severity_report)))
+        # Kruskal-Wallis severity significance table
+        if hasattr(severity_report, "kruskal_df") and not severity_report.kruskal_df.empty:
+            table_specs.append(("severity_kruskal", generate_kruskal_table(severity_report.kruskal_df)))
 
     if fusion_report is not None or fusion_metrics_df is not None:
         table_specs.append(("fusion", generate_fusion_table(fusion_report, fusion_metrics_df)))
+        # Significance tests
+        if fusion_report is not None and hasattr(fusion_report, "significance_df") and not fusion_report.significance_df.empty:
+            table_specs.append(("fusion_significance", generate_fusion_significance_table(fusion_report.significance_df)))
+        # OR dominance
+        if fusion_report is not None and hasattr(fusion_report, "or_dominance_df") and not fusion_report.or_dominance_df.empty:
+            table_specs.append(("fusion_or_dominance", generate_or_dominance_table(fusion_report.or_dominance_df)))
+
+    if threshold_comparison_df is not None and not threshold_comparison_df.empty:
+        table_specs.append(("threshold_comparison", generate_threshold_comparison_table(threshold_comparison_df)))
 
     for table_name, content in table_specs:
         for fmt, data in content.items():
