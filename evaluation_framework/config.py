@@ -85,6 +85,9 @@ class EvalConfig:
     # Dry-run: restrict to one subject for smoke-testing
     dry_run: bool = False
 
+    # Unused/Pass-through config block for documentation
+    semi_supervised: Optional[dict] = field(default=None)
+
     def validate(self) -> None:
         """Raise ValueError for invalid config values."""
         invalid_thresh = set(self.threshold_methods) - _VALID_THRESHOLD_METHODS

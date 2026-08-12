@@ -11,13 +11,24 @@ Architecture (per channel):
                          dim_feedforward=128, dropout=0.1
     Decoder proj.    : Linear(64, 1)  → reconstruction
 
+    [Semi-supervised extension]
+    Classifier head (optional):
+              Mean-pool encoder output across time → (batch, d_model)
+              Linear(d_model, 1) + Sigmoid
+              Trained jointly: total_loss = recon_loss + lambda_cls * bce_loss
+
+    Mean-pool rationale: anomalies (amplitude scale, time warp, time shift)
+    are often localised in time.  Mean-pooling aggregates signal across the
+    full sequence without requiring the model to learn an attention location
+    (CLS token) or risk fixating on a single spike (max-pool).
+
 Input  shape : (batch, window_size, 1)
 Output shape : (batch, window_size, 1)
-Loss         : MSE
+Loss         : MSE  [+ optional lambda_cls × BCE]
 Anomaly score: MSE between input and reconstruction (per window)
+               OR sigmoid classifier probability via anomaly_probability()
 
-One model instance is trained independently per sEMG channel (9 total).
-"""
+One model instance is trained independently per sEMG channel (9 total)."""
 
 import os
 import math
@@ -85,11 +96,16 @@ class PositionalEncoding(nn.Module):
 
 class TransformerAutoencoder(nn.Module):
     """
-    Transformer autoencoder for 1D time-series reconstruction.
+    Transformer autoencoder for 1D time-series reconstruction with optional
+    semi-supervised classifier head.
 
     The encoder processes the positionally-encoded input through a standard
     TransformerEncoder stack. A linear projection maps the encoder output
     back to the original 1D signal space.
+
+    When use_classifier=True, a mean-pool over the encoder's time-axis output
+    produces a (batch, d_model) latent vector that feeds into a lightweight
+    Linear(d_model, 1)+Sigmoid classifier head.
     """
 
     def __init__(
@@ -100,9 +116,11 @@ class TransformerAutoencoder(nn.Module):
         num_encoder_layers: int = 2,
         dim_feedforward: int = 128,
         dropout: float = 0.1,
+        use_classifier: bool = False,
     ):
         super().__init__()
-        self.d_model = d_model
+        self.d_model        = d_model
+        self.use_classifier = use_classifier
 
         # Input projection: 1 → d_model
         self.input_proj = nn.Linear(1, d_model)
@@ -126,8 +144,64 @@ class TransformerAutoencoder(nn.Module):
         # Output projection: d_model → 1
         self.output_proj = nn.Linear(d_model, 1)
 
+        # Optional classifier head: mean-pooled latent (batch, d_model) → prob (batch, 1)
+        if use_classifier:
+            self.classifier_head = nn.Sequential(
+                nn.Linear(d_model, 1),
+                nn.Sigmoid(),
+            )
+        else:
+            self.classifier_head = None  # type: ignore[assignment]
+
+    # ------------------------------------------------------------------
+    # Core encode helpers (shared between forward and anomaly_probability)
+    # ------------------------------------------------------------------
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode x and return the mean-pooled latent vector.
+
+        Parameters
+        ----------
+        x : torch.Tensor  shape (batch, window_size, 1)
+
+        Returns
+        -------
+        latent : torch.Tensor  shape (batch, d_model)
+            Mean-pool of encoder output across the time axis.
+        """
+        h = self.input_proj(x)              # (batch, T, d_model)
+        h = self.pos_enc(h)                 # (batch, T, d_model)
+        h = self.transformer_encoder(h)     # (batch, T, d_model)
+        return h.mean(dim=1)                # (batch, d_model)  — mean-pool
+
+    def classify(self, latent: torch.Tensor) -> torch.Tensor:
+        """
+        Run the classifier head on a pre-computed latent vector.
+
+        Parameters
+        ----------
+        latent : torch.Tensor  shape (batch, d_model)
+
+        Returns
+        -------
+        prob : torch.Tensor  shape (batch, 1)  values in [0, 1]
+
+        Raises
+        ------
+        RuntimeError  if the model was built without use_classifier=True.
+        """
+        if self.classifier_head is None:
+            raise RuntimeError(
+                "classify() called on a model built with use_classifier=False. "
+                "Reconstruct TransformerModel with use_classifier=True."
+            )
+        return self.classifier_head(latent)  # (batch, 1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Reconstruction forward pass (unchanged signature).
+
         Parameters
         ----------
         x : torch.Tensor  shape (batch, window_size, 1)
@@ -137,13 +211,13 @@ class TransformerAutoencoder(nn.Module):
         torch.Tensor  shape (batch, window_size, 1)
         """
         # Project to d_model
-        h = self.input_proj(x)          # (batch, T, 64)
+        h = self.input_proj(x)          # (batch, T, d_model)
 
         # Add positional encoding
-        h = self.pos_enc(h)             # (batch, T, 64)
+        h = self.pos_enc(h)             # (batch, T, d_model)
 
         # Transformer encoder (self-attention + FFN)
-        h = self.transformer_encoder(h) # (batch, T, 64)
+        h = self.transformer_encoder(h) # (batch, T, d_model)
 
         # Project back to 1D
         recon = self.output_proj(h)     # (batch, T, 1)
@@ -159,6 +233,14 @@ class TransformerModel:
     High-level wrapper around TransformerAutoencoder.
 
     One instance should be created per sEMG channel.
+
+    Semi-supervised mode (optional):
+        m = TransformerModel(ch_name, use_classifier=True, lambda_cls=0.5)
+        m.fit(train_windows, val_windows)   # augmentation happens internally
+        probs = m.anomaly_probability(test_windows)   # [0, 1] per window
+
+    All new parameters default to the original unsupervised behaviour so
+    existing call sites (notebook, run_pipeline) work without modification.
     """
 
     def __init__(
@@ -175,18 +257,29 @@ class TransformerModel:
         batch_size: int = 32,
         patience: int = 5,
         device: Optional[str] = None,
+        # ── Semi-supervised options (all backward-compatible defaults) ──
+        use_classifier: bool = False,
+        lambda_cls: float = 0.5,
+        augmentation_fraction: float = 0.20,
+        augmentation_severity: str = "moderate",
+        augmentation_types: Optional[List[str]] = None,
     ):
-        self.channel_name       = channel_name
-        self.window_size        = window_size
-        self.d_model            = d_model
-        self.nhead              = nhead
-        self.num_encoder_layers = num_encoder_layers
-        self.dim_feedforward    = dim_feedforward
-        self.dropout            = dropout
-        self.lr                 = lr
-        self.epochs             = epochs
-        self.batch_size         = batch_size
-        self.patience           = patience
+        self.channel_name          = channel_name
+        self.window_size           = window_size
+        self.d_model               = d_model
+        self.nhead                 = nhead
+        self.num_encoder_layers    = num_encoder_layers
+        self.dim_feedforward       = dim_feedforward
+        self.dropout               = dropout
+        self.lr                    = lr
+        self.epochs                = epochs
+        self.batch_size            = batch_size
+        self.patience              = patience
+        self.use_classifier        = use_classifier
+        self.lambda_cls            = lambda_cls
+        self.augmentation_fraction = augmentation_fraction
+        self.augmentation_severity = augmentation_severity
+        self.augmentation_types    = augmentation_types
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -204,6 +297,7 @@ class TransformerModel:
             num_encoder_layers=self.num_encoder_layers,
             dim_feedforward=self.dim_feedforward,
             dropout=self.dropout,
+            use_classifier=self.use_classifier,
         ).to(self.device)
 
     def fit(
@@ -212,30 +306,73 @@ class TransformerModel:
         val_windows: Optional[np.ndarray] = None,
     ) -> "TransformerModel":
         """
-        Train the Transformer autoencoder on windows for this channel.
+        Train the Transformer autoencoder (and optional classifier head) on windows.
 
         Parameters
         ----------
         train_windows : np.ndarray
             Shape (N_train, window_size, 1)
         val_windows : np.ndarray, optional
-            Shape (N_val, window_size, 1) — for early stopping.
+            Shape (N_val, window_size, 1) — for early stopping (reconstruction
+            loss only; classifier does not affect early stopping).
 
         Returns
         -------
         self
+
+        Notes
+        -----
+        When use_classifier=True the training set is internally augmented:
+        a fraction of clean windows are replaced by synthetic anomalies and
+        labeled 1 (anomalous). The augmented set is materialised ONCE with
+        RANDOM_SEED=42 for reproducibility. The combined loss is:
+
+            total_loss = recon_loss + lambda_cls * bce_loss
+
+        Known limitation: early stopping monitors reconstruction-only val loss,
+        so the classifier head may be underfit/overfit when training stops.
+        Future work: monitor val_recon + lambda_cls * val_bce, or val_bce alone
+        with an augmented val set, once the semi-supervised path is validated.
         """
         _set_seeds()
         self.model = self._build_model()
         optimizer  = torch.optim.Adam(self.model.parameters(), lr=self.lr)
-        criterion  = nn.MSELoss()
+        mse_criterion = nn.MSELoss()
+        bce_criterion = nn.BCELoss() if self.use_classifier else None
 
-        X_train = torch.tensor(train_windows, dtype=torch.float32)
-        train_loader = DataLoader(
-            TensorDataset(X_train),
-            batch_size=self.batch_size,
-            shuffle=True,
-        )
+        # ── Build training tensors (augment if semi-supervised) ────────────
+        if self.use_classifier:
+            from semg_pipeline.augmenter import augment_with_anomalies
+            aug_windows, aug_labels = augment_with_anomalies(
+                train_windows,
+                fraction=self.augmentation_fraction,
+                anomaly_types=self.augmentation_types,
+                severity=self.augmentation_severity,
+            )
+            X_train = torch.tensor(aug_windows, dtype=torch.float32)
+            Y_train = torch.tensor(aug_labels,  dtype=torch.float32)  # (N,)
+            logger.info(
+                f"[Transformer][{self.channel_name}] Semi-supervised augmentation: "
+                f"{int(aug_labels.sum())}/{len(aug_labels)} anomalous windows "
+                f"(fraction={self.augmentation_fraction}, "
+                f"severity={self.augmentation_severity})"
+            )
+        else:
+            X_train = torch.tensor(train_windows, dtype=torch.float32)
+            Y_train = None
+
+        if Y_train is not None:
+            train_loader = DataLoader(
+                TensorDataset(X_train, Y_train),
+                batch_size=self.batch_size,
+                shuffle=True,
+            )
+        else:
+            train_loader = DataLoader(
+                TensorDataset(X_train),
+                batch_size=self.batch_size,
+                shuffle=True,
+            )
 
         has_val = val_windows is not None and len(val_windows) > 0
         if has_val:
@@ -251,20 +388,45 @@ class TransformerModel:
         best_state       = None
 
         for epoch in range(1, self.epochs + 1):
-            # ── Training ──
+            # ── Training ──────────────────────────────────────────────────
             self.model.train()
-            train_loss = 0.0
-            for (batch_x,) in train_loader:
-                batch_x = batch_x.to(self.device)
-                optimizer.zero_grad()
-                recon = self.model(batch_x)
-                loss  = criterion(recon, batch_x)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item() * len(batch_x)
-            train_loss /= len(X_train)
+            train_loss_total = 0.0
 
-            # ── Validation + early stopping ──
+            if self.use_classifier:
+                for batch_x, batch_y in train_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_y = batch_y.to(self.device)     # (batch,)
+
+                    optimizer.zero_grad()
+
+                    # Reconstruction loss (full forward pass)
+                    recon = self.model(batch_x)            # (batch, T, 1)
+                    recon_loss = mse_criterion(recon, batch_x)
+
+                    # Classification loss (mean-pool latent)
+                    latent = self.model.encode(batch_x)             # (batch, d_model)
+                    prob   = self.model.classify(latent).squeeze(1) # (batch,)
+                    cls_loss = bce_criterion(prob, batch_y)          # type: ignore[misc]
+
+                    loss = recon_loss + self.lambda_cls * cls_loss
+                    loss.backward()
+                    optimizer.step()
+                    train_loss_total += loss.item() * len(batch_x)
+            else:
+                for (batch_x,) in train_loader:
+                    batch_x = batch_x.to(self.device)
+                    optimizer.zero_grad()
+                    recon = self.model(batch_x)
+                    loss  = mse_criterion(recon, batch_x)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss_total += loss.item() * len(batch_x)
+
+            train_loss = train_loss_total / len(X_train)
+
+            # ── Validation + early stopping (reconstruction loss only) ───
+            # Known limitation: classifier head fitness is not monitored here.
+            # See docstring Notes for future improvement path.
             if has_val:
                 self.model.eval()
                 val_loss = 0.0
@@ -272,7 +434,7 @@ class TransformerModel:
                     for (batch_x,) in val_loader:
                         batch_x = batch_x.to(self.device)
                         recon = self.model(batch_x)
-                        val_loss += criterion(recon, batch_x).item() * len(batch_x)
+                        val_loss += mse_criterion(recon, batch_x).item() * len(batch_x)
                 val_loss /= len(X_val)
 
                 if epoch % 5 == 0 or epoch == 1:
@@ -285,7 +447,10 @@ class TransformerModel:
                 if val_loss < best_val_loss:
                     best_val_loss    = val_loss
                     patience_counter = 0
-                    best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                    best_state = {
+                        k: v.cpu().clone()
+                        for k, v in self.model.state_dict().items()
+                    }
                 else:
                     patience_counter += 1
                     if patience_counter >= self.patience:
@@ -311,6 +476,10 @@ class TransformerModel:
     def score(self, windows: np.ndarray) -> np.ndarray:
         """
         Compute per-window reconstruction MSE.
+
+        This method is unchanged from the original unsupervised implementation.
+        It always returns reconstruction error regardless of whether the
+        classifier head is enabled.
 
         Parameters
         ----------
@@ -339,13 +508,82 @@ class TransformerModel:
 
         return np.concatenate(errors, axis=0)
 
+    def anomaly_probability(self, windows: np.ndarray) -> np.ndarray:
+        """
+        Return the classifier head's sigmoid output for each window.
+
+        Values close to 1 indicate the model believes the window is anomalous.
+        This is the classifier-based alternative to reconstruction-error
+        thresholding.
+
+        Parameters
+        ----------
+        windows : np.ndarray
+            Shape (N, window_size, 1)
+
+        Returns
+        -------
+        probs : np.ndarray
+            Shape (N,)  — values in [0, 1].
+
+        Raises
+        ------
+        RuntimeError
+            If fit() has not been called, or if the model was built / loaded
+            without use_classifier=True.
+        """
+        if self.model is None:
+            raise RuntimeError("Call fit() before anomaly_probability().")
+        if not self.use_classifier or self.model.classifier_head is None:
+            raise RuntimeError(
+                "anomaly_probability() requires use_classifier=True. "
+                "Reconstruct TransformerModel with use_classifier=True and re-train."
+            )
+
+        self.model.eval()
+        X = torch.tensor(windows, dtype=torch.float32)
+        loader = DataLoader(TensorDataset(X), batch_size=self.batch_size, shuffle=False)
+
+        probs = []
+        with torch.no_grad():
+            for (batch_x,) in loader:
+                batch_x = batch_x.to(self.device)
+                latent  = self.model.encode(batch_x)               # (batch, d_model)
+                prob    = self.model.classify(latent).squeeze(1)   # (batch,)
+                probs.append(prob.cpu().numpy())
+
+        return np.concatenate(probs, axis=0)  # (N,)
+
     def save(self, path: str) -> None:
+        """Save model weights to path (includes classifier head if present)."""
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         torch.save(self.model.state_dict(), path)
 
     def load(self, path: str) -> "TransformerModel":
+        """
+        Load model weights from path.
+
+        Backward compatibility: if the checkpoint was saved without a classifier
+        head (old unsupervised model), missing classifier keys are initialised
+        from scratch and a warning is emitted.  score() still works; calling
+        anomaly_probability() after loading an old checkpoint will raise
+        RuntimeError unless use_classifier=True and the key is present.
+        """
         _set_seeds()
         self.model = self._build_model()
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        state_dict = torch.load(path, map_location=self.device)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(
+                f"[Transformer][{self.channel_name}] load(): {len(missing)} missing keys "
+                f"(classifier head not in checkpoint — score() works, "
+                f"anomaly_probability() requires re-training with use_classifier=True). "
+                f"Missing: {missing}"
+            )
+        if unexpected:
+            logger.warning(
+                f"[Transformer][{self.channel_name}] load(): {len(unexpected)} unexpected keys "
+                f"ignored: {unexpected}"
+            )
         self.model.eval()
         return self

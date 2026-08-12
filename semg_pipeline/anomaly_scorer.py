@@ -20,6 +20,10 @@ Output CSV schema (must match teammate's kinematics/kinetics pipeline exactly):
     window_start_time, window_end_time, reconstruction_error,
     is_synthetic_anomaly, anomaly_type, predicted_label, model_name,
     severity, threshold_method
+
+    [Semi-supervised extension — present only when use_classifier=True]
+    anomaly_probability  — sigmoid output of the classifier head [0, 1]
+                           NaN / absent when reconstruction-only mode.
 """
 
 import json
@@ -176,11 +180,15 @@ def build_output_rows(
     anomaly_type: str = "none",
     window_id_offset: int = 0,
     severity: float = 0.0,
+    classifier_probs: Optional[np.ndarray] = None,
 ) -> List[Dict]:
     """
     Build a list of output CSV row dicts for one channel, one model run.
 
-    Each dict has the 13 output CSV columns (12 original + severity).
+    Each dict has the 13 core output CSV columns (12 original + severity).
+    When classifier_probs is provided, a 14th column `anomaly_probability`
+    is added; otherwise the column is absent so existing downstream code
+    that does not expect it continues to work unchanged.
 
     Parameters
     ----------
@@ -208,31 +216,37 @@ def build_output_rows(
     severity : float, default 0.0
         Numeric severity level (0.15=mild, 0.35=moderate, 0.60=severe, 0.0=clean).
         Used by evaluate.py for severity-stratified analysis.
+    classifier_probs : np.ndarray, optional
+        Shape (N,) sigmoid probabilities from the classifier head, values in [0, 1].
+        When provided, each row gains an ``anomaly_probability`` key.
+        When None (default), the key is omitted — backward compatible.
 
     Returns
     -------
     List[Dict]
         One dict per window, ready to be passed to pd.DataFrame().
     """
+    has_probs = classifier_probs is not None
     rows = []
     for i, (meta, err, pred) in enumerate(zip(windows_meta, errors, predicted_labels)):
-        rows.append(
-            {
-                "subject_id":           subject_id,
-                "modality":             "sEMG",
-                "channel_name":         channel_name,
-                "movement":             movement,
-                "window_id":            i + window_id_offset,
-                "window_start_time":    meta["start_time"],
-                "window_end_time":      meta["end_time"],
-                "reconstruction_error": float(err),
-                "is_synthetic_anomaly": int(is_synthetic_anomaly),
-                "anomaly_type":         anomaly_type,
-                "predicted_label":      int(pred),
-                "model_name":           model_name,
-                "severity":             float(severity),
-            }
-        )
+        row = {
+            "subject_id":           subject_id,
+            "modality":             "sEMG",
+            "channel_name":         channel_name,
+            "movement":             movement,
+            "window_id":            i + window_id_offset,
+            "window_start_time":    meta["start_time"],
+            "window_end_time":      meta["end_time"],
+            "reconstruction_error": float(err),
+            "is_synthetic_anomaly": int(is_synthetic_anomaly),
+            "anomaly_type":         anomaly_type,
+            "predicted_label":      int(pred),
+            "model_name":           model_name,
+            "severity":             float(severity),
+        }
+        if has_probs:
+            row["anomaly_probability"] = float(classifier_probs[i])
+        rows.append(row)
     return rows
 
 
@@ -253,6 +267,8 @@ def score_and_build_rows(
     is_synthetic_anomaly: int = 0,
     anomaly_type: str = "none",
     window_id_offset: int = 0,
+    include_classifier: bool = False,
+    use_classifier_labeling: bool = False,
 ) -> Tuple[List[Dict], np.ndarray]:
     """
     Score a set of windows with the model and build output rows.
@@ -268,6 +284,12 @@ def score_and_build_rows(
         Shape (N, window_size, 9) — full multi-channel windows.
     channel_idx : int
         Index of the channel to score.
+    include_classifier : bool, default False
+        If True and the model has anomaly_probability(), call it and include
+        the result as the ``anomaly_probability`` column in output rows.
+    use_classifier_labeling : bool, default False
+        If True and include_classifier=True, derive predicted_label from
+        classifier probability (prob > 0.5) instead of reconstruction threshold.
     ... (see build_output_rows for other params)
 
     Returns
@@ -285,10 +307,29 @@ def score_and_build_rows(
         ch_windows = windows[:, :, channel_idx : channel_idx + 1]
         errors     = model.score(ch_windows)      # (N,)
 
-    predicted = label_windows(errors, threshold)
+    # ── Optionally collect classifier probabilities ───────────────────
+    cls_probs: Optional[np.ndarray] = None
+    if include_classifier and not isinstance(model, SARIMAModel):
+        try:
+            ch_windows_for_cls = windows[:, :, channel_idx : channel_idx + 1]
+            cls_probs = model.anomaly_probability(ch_windows_for_cls)
+        except RuntimeError as exc:
+            logger.warning(
+                f"[score_and_build_rows] anomaly_probability() unavailable "
+                f"for {channel_name}: {exc}. Falling back to reconstruction-only."
+            )
+            cls_probs = None
+
+    # ── Determine predicted labels ───────────────────────────────
+    if use_classifier_labeling and cls_probs is not None:
+        predicted = (cls_probs > 0.5).astype(int)
+    else:
+        predicted = label_windows(errors, threshold)
+
     rows = build_output_rows(
         windows_meta, errors, predicted,
         channel_name, subject_id, movement, model_name,
         is_synthetic_anomaly, anomaly_type, window_id_offset,
+        classifier_probs=cls_probs,
     )
     return rows, errors

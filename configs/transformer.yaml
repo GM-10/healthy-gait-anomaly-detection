@@ -58,3 +58,15 @@ dry_run: false
   - svg
 
 dry_run: false
+
+# Semi-supervised training configuration for LSTM and Transformer models.
+# NOTE: This block is currently documentation/reference only. 
+# Actual training-time semi-supervised behavior is controlled via run_pipeline.py 
+# CLI flags (--semi_supervised, --augmentation_fraction, --lambda_cls), not by this YAML block.
+semi_supervised:
+  enabled: true                  # Set to true to train/load with classifier head
+  augmentation_fraction: 0.20    # Fraction of normal train windows replaced by synthetic anomalies
+  lambda_cls: 0.5                # Weighting multiplier for the binary cross entropy loss
+  augmentation_severity: moderate # Severity level of synthetic anomalies used for training
+  use_classifier_labeling: false # Set to true to classify using probability > 0.5 instead of reconstruction thresholds
+

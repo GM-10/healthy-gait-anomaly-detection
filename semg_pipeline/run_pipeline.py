@@ -286,6 +286,11 @@ def _train_lstm(
     val_windows: np.ndarray,
     model_dir: str,
     max_subjects: Optional[int] = None,
+    use_classifier: bool = False,
+    lambda_cls: float = 0.5,
+    augmentation_fraction: float = 0.20,
+    augmentation_severity: str = "moderate",
+    augmentation_types: Optional[List] = None,
 ) -> List:
     from semg_pipeline.models.lstm_model import LSTMModel
 
@@ -308,7 +313,15 @@ def _train_lstm(
     models = []
     for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
         logger.info(f"[LSTM] Training channel {ch_idx + 1}/9: {ch_name}")
-        m = LSTMModel(channel_name=ch_name, window_size=WINDOW_SIZE)
+        m = LSTMModel(
+            channel_name=ch_name,
+            window_size=WINDOW_SIZE,
+            use_classifier=use_classifier,
+            lambda_cls=lambda_cls,
+            augmentation_fraction=augmentation_fraction,
+            augmentation_severity=augmentation_severity,
+            augmentation_types=augmentation_types,
+        )
         train_ch = train_windows[:, :, ch_idx : ch_idx + 1]
         val_ch   = val_windows[:, :, ch_idx : ch_idx + 1] if len(val_windows) > 0 else None
         m.fit(train_ch, val_ch)
@@ -322,13 +335,26 @@ def _train_transformer(
     train_windows: np.ndarray,
     val_windows: np.ndarray,
     model_dir: str,
+    use_classifier: bool = False,
+    lambda_cls: float = 0.5,
+    augmentation_fraction: float = 0.20,
+    augmentation_severity: str = "moderate",
+    augmentation_types: Optional[List] = None,
 ) -> List:
     from semg_pipeline.models.transformer_model import TransformerModel
 
     models = []
     for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
         logger.info(f"[Transformer] Training channel {ch_idx + 1}/9: {ch_name}")
-        m = TransformerModel(channel_name=ch_name, window_size=WINDOW_SIZE)
+        m = TransformerModel(
+            channel_name=ch_name,
+            window_size=WINDOW_SIZE,
+            use_classifier=use_classifier,
+            lambda_cls=lambda_cls,
+            augmentation_fraction=augmentation_fraction,
+            augmentation_severity=augmentation_severity,
+            augmentation_types=augmentation_types,
+        )
         train_ch = train_windows[:, :, ch_idx : ch_idx + 1]
         val_ch   = val_windows[:, :, ch_idx : ch_idx + 1] if len(val_windows) > 0 else None
         m.fit(train_ch, val_ch)
@@ -444,6 +470,8 @@ def score_test_trial(
     output_dir: str,
     anomaly_conditions: List[Tuple],
     severity_tag: str = "",
+    include_classifier: bool = False,
+    use_classifier_labeling: bool = False,
 ) -> None:
     """
     Score one test trial for all active models.
@@ -457,6 +485,12 @@ def score_test_trial(
         Inserted into the output filename before '_scores.csv' when non-empty.
         e.g. 'mild' -> Sub36_WAK_LSTM_mild_scores.csv
         Empty string -> Sub36_WAK_LSTM_scores.csv  (default / backward-compat)
+    include_classifier : bool, default False
+        When True, calls anomaly_probability() on each LSTM/Transformer model
+        and includes the result as the `anomaly_probability` column.
+    use_classifier_labeling : bool, default False
+        When True (and include_classifier=True), derives predicted_label from
+        classifier probability instead of reconstruction threshold.
     """
     _, windows, meta = _process_trial(base_dir, subject, movement, scaling_params)
     if windows is None or len(windows) == 0:
@@ -471,23 +505,46 @@ def score_test_trial(
         model_display = MODEL_REGISTRY[model_key]
         all_rows: List[Dict] = []
 
-        # ── A) Clean windows ─────────────────────────────────────────────────
+        # ── A) Clean windows ────────────────────────────────────────────
         for ch_idx, ch_name in enumerate(SEMG_CHANNELS):
             th = thresholds[model_key][ch_name]
 
             if model_key == "sarima":
                 errors = model_or_list.score(windows)[:, ch_idx]
+                preds  = label_windows(errors, th)
+                rows   = build_output_rows(
+                    meta, errors, preds, ch_name, subject, movement,
+                    model_display,
+                    is_synthetic_anomaly=0, anomaly_type="none",
+                    window_id_offset=0, severity=0.0,
+                )
             else:
-                ch_win = windows[:, :, ch_idx : ch_idx + 1]
-                errors = model_or_list[ch_idx].score(ch_win)
+                ch_win  = windows[:, :, ch_idx : ch_idx + 1]
+                errors  = model_or_list[ch_idx].score(ch_win)
 
-            preds = label_windows(errors, th)
-            rows  = build_output_rows(
-                meta, errors, preds, ch_name, subject, movement,
-                model_display,
-                is_synthetic_anomaly=0, anomaly_type="none",
-                window_id_offset=0, severity=0.0,
-            )
+                # Optionally collect classifier probabilities
+                cls_probs = None
+                if include_classifier:
+                    try:
+                        cls_probs = model_or_list[ch_idx].anomaly_probability(ch_win)
+                    except RuntimeError as exc:
+                        logger.warning(
+                            f"  [{model_display}] anomaly_probability() failed "
+                            f"for {ch_name}: {exc}"
+                        )
+
+                if use_classifier_labeling and cls_probs is not None:
+                    preds = (cls_probs > 0.5).astype(int)
+                else:
+                    preds = label_windows(errors, th)
+
+                rows = build_output_rows(
+                    meta, errors, preds, ch_name, subject, movement,
+                    model_display,
+                    is_synthetic_anomaly=0, anomaly_type="none",
+                    window_id_offset=0, severity=0.0,
+                    classifier_probs=cls_probs,
+                )
             all_rows.extend(rows)
 
         # ── B) Anomalous windows ─────────────────────────────────────────────
@@ -509,25 +566,43 @@ def score_test_trial(
 
                 if model_key == "sarima":
                     errors = model_or_list.score(anom_windows)[:, ch_idx]
+                    preds  = label_windows(errors, th)
+                    rows   = build_output_rows(
+                        meta, errors, preds, ch_name, subject, movement,
+                        model_display,
+                        is_synthetic_anomaly=1,
+                        anomaly_type=atype,
+                        window_id_offset=window_id_offset,
+                        severity=float(sev_numeric),
+                    )
                 else:
-                    ch_win = anom_windows[:, :, ch_idx : ch_idx + 1]
-                    errors = model_or_list[ch_idx].score(ch_win)
+                    ch_win  = anom_windows[:, :, ch_idx : ch_idx + 1]
+                    errors  = model_or_list[ch_idx].score(ch_win)
 
-                preds = label_windows(errors, th)
-                # Numeric severity value for this condition
-                from utils.synthetic_anomalies import DEFAULT_SEVERITIES
-                sev_numeric = inject_kwargs.get(
-                    "severity",
-                    DEFAULT_SEVERITIES.get(severity_label, 0.35),
-                )
-                rows  = build_output_rows(
-                    meta, errors, preds, ch_name, subject, movement,
-                    model_display,
-                    is_synthetic_anomaly=1,
-                    anomaly_type=atype,
-                    window_id_offset=window_id_offset,
-                    severity=float(sev_numeric),
-                )
+                    cls_probs = None
+                    if include_classifier:
+                        try:
+                            cls_probs = model_or_list[ch_idx].anomaly_probability(ch_win)
+                        except RuntimeError as exc:
+                            logger.warning(
+                                f"  [{model_display}] anomaly_probability() failed "
+                                f"for {ch_name}: {exc}"
+                            )
+
+                    if use_classifier_labeling and cls_probs is not None:
+                        preds = (cls_probs > 0.5).astype(int)
+                    else:
+                        preds = label_windows(errors, th)
+
+                    rows = build_output_rows(
+                        meta, errors, preds, ch_name, subject, movement,
+                        model_display,
+                        is_synthetic_anomaly=1,
+                        anomaly_type=atype,
+                        window_id_offset=window_id_offset,
+                        severity=float(sev_numeric),
+                        classifier_probs=cls_probs,
+                    )
                 all_rows.extend(rows)
 
         # ── Save output CSV ───────────────────────────────────────────────────
@@ -542,7 +617,7 @@ def score_test_trial(
             "subject_id", "modality", "channel_name", "movement", "window_id",
             "window_start_time", "window_end_time", "reconstruction_error",
             "is_synthetic_anomaly", "anomaly_type", "predicted_label", "model_name",
-            "severity",
+            "severity", "anomaly_probability",
         ]
         # Only keep columns that exist (backward-compatible)
         col_order = [c for c in col_order if c in out_df.columns]
@@ -689,6 +764,60 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Process only Sub01 (train), Sub31 (val), Sub36 (test) for smoke-testing.",
     )
+    # ── Semi-supervised options ─────────────────────────────────────────────
+    parser.add_argument(
+        "--semi_supervised",
+        action="store_true",
+        help=(
+            "Enable semi-supervised training: attach a classifier head to "
+            "LSTM/Transformer encoders and train jointly with a combined "
+            "reconstruction + classification loss. "
+            "See also: --augmentation_fraction, --lambda_cls, "
+            "--augmentation_severity, --use_classifier_labeling."
+        ),
+    )
+    parser.add_argument(
+        "--augmentation_fraction",
+        type=float,
+        default=0.20,
+        help=(
+            "Fraction of training windows replaced by synthetic anomalies during "
+            "semi-supervised training (default: 0.20). "
+            "Only used when --semi_supervised is set. "
+            "Sweep this value (e.g. 0.10, 0.20, 0.30) to find the optimal trade-off."
+        ),
+    )
+    parser.add_argument(
+        "--lambda_cls",
+        type=float,
+        default=0.5,
+        help=(
+            "Weight of the classification loss in combined loss: "
+            "total_loss = recon_loss + lambda_cls * bce_loss (default: 0.5). "
+            "Only used when --semi_supervised is set. "
+            "Sweep this value (e.g. 0.1, 0.5, 1.0) for ablation study."
+        ),
+    )
+    parser.add_argument(
+        "--augmentation_severity",
+        default="moderate",
+        choices=["mild", "moderate", "severe"],
+        help=(
+            "Severity level for synthetic anomalies injected during training "
+            "(default: moderate=0.35). Only used when --semi_supervised is set."
+        ),
+    )
+    parser.add_argument(
+        "--use_classifier_labeling",
+        action="store_true",
+        help=(
+            "At test time, derive predicted_label from classifier probability "
+            "(prob > 0.5) instead of reconstruction error threshold. "
+            "Only active when --semi_supervised is set. "
+            "When not set, reconstruction-error thresholding is used for labels "
+            "and the classifier probability is recorded as an extra column only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -707,6 +836,12 @@ def main() -> None:
     logger.info(f"  max_subjects    : {args.max_subjects or 'all (30)'}")
     logger.info(f"  sarima_max_subs : {args.sarima_max_subjects}")
     logger.info(f"  dry_run         : {args.dry_run}")
+    logger.info(f"  semi_supervised : {args.semi_supervised}")
+    if args.semi_supervised:
+        logger.info(f"    augmentation_fraction   : {args.augmentation_fraction}")
+        logger.info(f"    lambda_cls              : {args.lambda_cls}")
+        logger.info(f"    augmentation_severity   : {args.augmentation_severity}")
+        logger.info(f"    use_classifier_labeling : {args.use_classifier_labeling}")
 
     model_dir = os.path.join(args.output_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
@@ -803,10 +938,18 @@ def main() -> None:
                     active_models["lstm"] = _train_lstm(
                         train_windows, val_windows, model_dir,
                         max_subjects=args.max_subjects,
+                        use_classifier=args.semi_supervised,
+                        lambda_cls=args.lambda_cls,
+                        augmentation_fraction=args.augmentation_fraction,
+                        augmentation_severity=args.augmentation_severity,
                     )
                 elif model_key == "transformer":
                     active_models["transformer"] = _train_transformer(
-                        train_windows, val_windows, model_dir
+                        train_windows, val_windows, model_dir,
+                        use_classifier=args.semi_supervised,
+                        lambda_cls=args.lambda_cls,
+                        augmentation_fraction=args.augmentation_fraction,
+                        augmentation_severity=args.augmentation_severity,
                     )
                 elif model_key == "sarima":
                     active_models["sarima"] = _train_sarima(
@@ -837,6 +980,8 @@ def main() -> None:
                     args.output_dir,
                     anomaly_conditions=anomaly_conditions,
                     severity_tag=severity_tag,
+                    include_classifier=args.semi_supervised,
+                    use_classifier_labeling=getattr(args, "use_classifier_labeling", False),
                 )
 
     # ══════════════════════════════════════════════════════════════════════
