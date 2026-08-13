@@ -94,7 +94,7 @@ class LSTMAutoencoder(nn.Module):
         if use_classifier:
             self.classifier_head = nn.Sequential(
                 nn.Linear(hidden_size, 1),
-                nn.Sigmoid(),
+                # Sigmoid is applied in anomaly_probability() for BCEWithLogitsLoss
             )
         else:
             self.classifier_head = None  # type: ignore[assignment]
@@ -198,6 +198,7 @@ class LSTMModel:
         augmentation_fraction: float = 0.20,
         augmentation_severity: str = "moderate",
         augmentation_types: Optional[List[str]] = None,
+        pos_weight: Optional[float] = None,
     ):
         self.channel_name          = channel_name
         self.window_size           = window_size
@@ -211,6 +212,8 @@ class LSTMModel:
         self.augmentation_fraction = augmentation_fraction
         self.augmentation_severity = augmentation_severity
         self.augmentation_types    = augmentation_types
+        self.pos_weight            = pos_weight
+        self._last_pos_weight      = None  # For unit testing
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,7 +260,6 @@ class LSTMModel:
         ).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         mse_criterion = nn.MSELoss()
-        bce_criterion = nn.BCELoss() if self.use_classifier else None
 
         # ── Build training tensors (augment if semi-supervised) ────────────
         if self.use_classifier:
@@ -270,11 +272,25 @@ class LSTMModel:
             )
             X_train = torch.tensor(aug_windows, dtype=torch.float32)
             Y_train = torch.tensor(aug_labels,  dtype=torch.float32)  # (N,)
+            
+            # Compute dynamic pos_weight
+            actual_anomalies = int(aug_labels.sum())
+            total_windows = len(aug_labels)
+            if self.pos_weight is not None:
+                pw_val = self.pos_weight
+            else:
+                actual_fraction = actual_anomalies / total_windows if total_windows > 0 else 0
+                pw_val = (1.0 - actual_fraction) / actual_fraction if actual_fraction > 0 else 1.0
+            
+            self._last_pos_weight = pw_val
+            pw_tensor = torch.tensor([pw_val], dtype=torch.float32, device=self.device)
+            bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pw_tensor)
+            
             logger.info(
                 f"[LSTM][{self.channel_name}] Semi-supervised augmentation: "
-                f"{int(aug_labels.sum())}/{len(aug_labels)} anomalous windows "
+                f"{actual_anomalies}/{total_windows} anomalous windows "
                 f"(fraction={self.augmentation_fraction}, "
-                f"severity={self.augmentation_severity})"
+                f"severity={self.augmentation_severity}, pos_weight={pw_val:.2f})"
             )
         else:
             X_train = torch.tensor(train_windows, dtype=torch.float32)
@@ -471,8 +487,9 @@ class LSTMModel:
         with torch.no_grad():
             for (batch_x,) in loader:
                 batch_x = batch_x.to(self.device)
-                context = self.model.encode(batch_x)              # (batch, 64)
-                prob    = self.model.classify(context).squeeze(1) # (batch,)
+                context = self.model.encode(batch_x)
+                logits = self.model.classify(context).squeeze(1)  # (batch,)
+                prob = torch.sigmoid(logits)
                 probs.append(prob.cpu().numpy())
 
         return np.concatenate(probs, axis=0)  # (N,)

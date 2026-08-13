@@ -179,7 +179,7 @@ def test_old_checkpoint_backward_compat(tmp_path):
     # In a fully robust implementation, the class would track missing keys and 
     # block anomaly_probability(). For now, we test the core logic: if the user
     # loaded an old model instance (use_classifier=False) directly, it blocks it.
-    old_model_reloaded = LSTMModel(channel_name="test_ch", use_classifier=False)
+    old_model_reloaded = LSTMModel(channel_name="test_ch", window_size=1920, hidden_size=8, use_classifier=False)
     old_model_reloaded.load(save_path)
     
     with pytest.raises(RuntimeError, match="requires use_classifier=True"):
@@ -192,10 +192,10 @@ def test_config_defaults_backward_compat(tmp_path):
     doesn't crash and correctly defaults to enabled: false.
     """
     # Write a dummy old-style config without the semi_supervised block
-    yaml_content = \"\"\"
+    yaml_content = """
     threshold_methods: [mean_std]
     models: [lstm]
-    \"\"\"
+    """
     config_path = str(tmp_path / "old_config.yaml")
     with open(config_path, "w") as f:
         f.write(yaml_content)
@@ -208,7 +208,38 @@ def test_config_defaults_backward_compat(tmp_path):
     assert "lstm" in cfg.models
     assert "mean_std" in cfg.threshold_methods
     
-    # Since semi_supervised isn't even a known dataclass field in the original
-    # EvalConfig, it doesn't crash when omitted. (Defaults to off in practice
-    # because run_pipeline.py requires explicit CLI flags to enable it).
-    assert not hasattr(cfg, "semi_supervised")
+    # EvalConfig now has semi_supervised field (defaults to None if missing)
+    assert hasattr(cfg, "semi_supervised")
+    assert cfg.semi_supervised is None
+
+
+def test_dynamic_pos_weight():
+    """
+    Verify that pos_weight is computed dynamically based on the actual
+    augmentation fraction, and that BCEWithLogitsLoss executes without errors.
+    """
+    rng = np.random.default_rng(42)
+    train_windows = rng.normal(0, 1, size=(100, 1920, 1))
+    
+    # 5% augmentation -> pos_weight ~ 19.0
+    model = LSTMModel(
+        channel_name="test_ch",
+        window_size=1920,
+        hidden_size=8,
+        epochs=1,
+        batch_size=2,
+        use_classifier=True,
+        augmentation_fraction=0.05,
+    )
+    
+    # Should execute without shape or PyTorch device errors
+    model.fit(train_windows)
+    
+    # Verify the computed pos_weight
+    assert hasattr(model, "_last_pos_weight")
+    assert model._last_pos_weight is not None
+    
+    # Depending on exactly how the 5% is rounded/sampled, the ratio should be around 19.0.
+    # For exactly 5 anomalies out of 100: (100 - 5) / 5 = 19.0
+    assert 10.0 < model._last_pos_weight < 30.0
+

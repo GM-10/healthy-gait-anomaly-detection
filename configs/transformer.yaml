@@ -54,10 +54,6 @@ figure_formats:
   - svg
 
 dry_run: false
-  - pdf
-  - svg
-
-dry_run: false
 
 # Semi-supervised training configuration for LSTM and Transformer models.
 # NOTE: This block is currently documentation/reference only. 
