@@ -264,25 +264,27 @@ class TransformerModel:
         augmentation_severity: str = "moderate",
         augmentation_types: Optional[List[str]] = None,
         pos_weight: Optional[float] = None,
+        classification_threshold: float = 0.5,
     ):
-        self.channel_name          = channel_name
-        self.window_size           = window_size
-        self.d_model               = d_model
-        self.nhead                 = nhead
-        self.num_encoder_layers    = num_encoder_layers
-        self.dim_feedforward       = dim_feedforward
-        self.dropout               = dropout
-        self.lr                    = lr
-        self.epochs                = epochs
-        self.batch_size            = batch_size
-        self.patience              = patience
-        self.use_classifier        = use_classifier
-        self.lambda_cls            = lambda_cls
-        self.augmentation_fraction = augmentation_fraction
-        self.augmentation_severity = augmentation_severity
-        self.augmentation_types    = augmentation_types
-        self.pos_weight            = pos_weight
-        self._last_pos_weight      = None  # For unit testing
+        self.channel_name             = channel_name
+        self.window_size              = window_size
+        self.d_model                  = d_model
+        self.nhead                    = nhead
+        self.num_encoder_layers       = num_encoder_layers
+        self.dim_feedforward          = dim_feedforward
+        self.dropout                  = dropout
+        self.lr                       = lr
+        self.epochs                   = epochs
+        self.batch_size               = batch_size
+        self.patience                 = patience
+        self.use_classifier           = use_classifier
+        self.lambda_cls               = lambda_cls
+        self.augmentation_fraction    = augmentation_fraction
+        self.augmentation_severity    = augmentation_severity
+        self.augmentation_types       = augmentation_types
+        self.pos_weight               = pos_weight
+        self.classification_threshold = classification_threshold
+        self._last_pos_weight         = None  # For unit testing
 
         if device is None:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -570,6 +572,34 @@ class TransformerModel:
                 probs.append(prob.cpu().numpy())
 
         return np.concatenate(probs, axis=0)  # (N,)
+
+    def predict_label(self, windows: np.ndarray) -> np.ndarray:
+        """
+        Return binary 0/1 anomaly labels by thresholding anomaly_probability().
+
+        Uses ``self.classification_threshold`` (default 0.5) as the cutoff.
+        A window is predicted anomalous (1) when its probability is **>=**
+        the threshold.  This is a convenience wrapper so downstream code
+        (evaluation, notebook) does not need to hard-code ``> 0.5``.
+
+        Parameters
+        ----------
+        windows : np.ndarray
+            Shape (N, window_size, 1)
+
+        Returns
+        -------
+        labels : np.ndarray
+            Shape (N,) — integer dtype, values in {0, 1}.
+
+        Raises
+        ------
+        RuntimeError
+            Propagated from anomaly_probability() if fit() was not called or
+            use_classifier=False.
+        """
+        probs = self.anomaly_probability(windows)
+        return (probs >= self.classification_threshold).astype(int)
 
     def save(self, path: str) -> None:
         """Save model weights to path (includes classifier head if present)."""

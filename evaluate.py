@@ -557,6 +557,22 @@ def _print_summary(
             best_f1 = grp["f1"].max()
             logger.info(f"    {model:15s}  {method:15s}  F1={best_f1:.4f}")
 
+    # 1b. Specificity / Balanced Accuracy summary (same ALL_CHANNELS rows)
+    if not comparison_df.empty and "specificity" in comparison_df.columns:
+        agg_rows = comparison_df[comparison_df.get("channel_name", pd.Series()) == "ALL_CHANNELS"]
+        if agg_rows.empty:
+            agg_rows = comparison_df
+        logger.info("\n  Specificity / Balanced Accuracy (macro-avg over channels):")
+        for (model, method), grp in agg_rows.groupby(["model_name", "threshold_method"]):
+            spec_vals = grp["specificity"].dropna()
+            ba_vals   = grp["balanced_accuracy"].dropna()
+            spec_str  = f"{spec_vals.mean():.4f}" if len(spec_vals) > 0 else "N/A"
+            ba_str    = f"{ba_vals.mean():.4f}"   if len(ba_vals)   > 0 else "N/A"
+            logger.info(
+                f"    {model:15s}  {method:15s}  "
+                f"Specificity={spec_str}  BalancedAcc={ba_str}"
+            )
+
     # 2. Threshold Agreement & Difference Overview
     if threshold_comparison_df is not None and not threshold_comparison_df.empty:
         logger.info("\n  Threshold Agreement & Difference Overview:")

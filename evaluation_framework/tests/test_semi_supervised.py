@@ -243,3 +243,135 @@ def test_dynamic_pos_weight():
     # For exactly 5 anomalies out of 100: (100 - 5) / 5 = 19.0
     assert 10.0 < model._last_pos_weight < 30.0
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New tests added for classification_threshold / predict_label()
+# and compute_specificity_and_balanced_accuracy()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_predict_label_respects_threshold():
+    """
+    predict_label() must apply self.classification_threshold to the output of
+    anomaly_probability().  We monkeypatch anomaly_probability() on both model
+    classes with a known probability array and verify that thresholds of 0.5,
+    0.55, and 0.6 all produce the correct binary labels.
+
+    Thresholding rule: label = 1  iff  prob >= threshold  (inclusive).
+    """
+    # Known probabilities to stub out.  We use a small array so we can reason
+    # about the expected labels without running any real inference.
+    stub_probs = np.array([0.3, 0.6, 0.5, 0.51], dtype=np.float32)
+
+    # Dummy windows — shape matches constructor but nothing is actually inferred.
+    dummy_windows = np.zeros((4, 32, 1), dtype=np.float32)
+
+    # Expected binary outputs for each threshold value:
+    #   prob:  0.3   0.6   0.5   0.51
+    #   >=0.50 → [0,   1,    1,    1 ]   (0.5 hits threshold, 0.51 too)
+    #   >=0.55 → [0,   1,    0,    0 ]   (only 0.6 passes)
+    #   >=0.60 → [0,   1,    0,    0 ]   (only 0.6 passes)
+    expected = {
+        0.50: np.array([0, 1, 1, 1], dtype=int),
+        0.55: np.array([0, 1, 0, 0], dtype=int),
+        0.60: np.array([0, 1, 0, 0], dtype=int),
+    }
+
+    for ModelClass, kwargs in [
+        (
+            LSTMModel,
+            dict(
+                channel_name="test_ch",
+                window_size=32,
+                hidden_size=4,
+                epochs=1,
+                batch_size=4,
+                use_classifier=True,
+            ),
+        ),
+        (
+            TransformerModel,
+            dict(
+                channel_name="test_ch",
+                window_size=32,
+                d_model=4,
+                nhead=2,
+                num_encoder_layers=1,
+                dim_feedforward=8,
+                epochs=1,
+                batch_size=4,
+                use_classifier=True,
+            ),
+        ),
+    ]:
+        for thresh, expected_labels in expected.items():
+            model = ModelClass(classification_threshold=thresh, **kwargs)
+
+            # Monkeypatch anomaly_probability to return a fixed array.
+            model.anomaly_probability = lambda w, _p=stub_probs: _p.copy()
+
+            labels = model.predict_label(dummy_windows)
+
+            assert labels.dtype in (np.int32, np.int64, int, np.intp), (
+                f"predict_label() must return an integer array, got {labels.dtype}"
+            )
+            assert labels.shape == (4,), (
+                f"predict_label() output shape mismatch: {labels.shape}"
+            )
+            np.testing.assert_array_equal(
+                labels,
+                expected_labels,
+                err_msg=(
+                    f"{ModelClass.__name__} @ threshold={thresh}: "
+                    f"got {labels.tolist()}, expected {expected_labels.tolist()}"
+                ),
+            )
+
+
+def test_compute_specificity_and_balanced_accuracy():
+    """
+    Verify compute_specificity_and_balanced_accuracy() for:
+    1. A normal case with all four confusion-matrix cells populated.
+    2. A zero-denominator edge case (TN+FP=0) — must NOT raise ZeroDivisionError.
+    3. An all-normal-windows case (TP+FN=0) — recall is undefined, so BA is None.
+    """
+    from evaluation_framework.statistics import compute_specificity_and_balanced_accuracy
+
+    # ── Case 1: Normal case ──────────────────────────────────────────────────
+    # TN=90, FP=10, FN=5, TP=95
+    # specificity = 90 / (90 + 10) = 0.9
+    # recall      = 95 / (95 + 5)  = 0.95
+    # BA          = (0.95 + 0.9) / 2 = 0.925
+    result = compute_specificity_and_balanced_accuracy(tn=90, fp=10, fn=5, tp=95)
+    assert result["specificity"]       == pytest.approx(0.9,   abs=1e-6)
+    assert result["balanced_accuracy"] == pytest.approx(0.925, abs=1e-6)
+
+    # ── Case 2: No actual-negative windows (TN+FP == 0) ─────────────────────
+    # specificity is mathematically undefined → must return None, not raise
+    result_no_neg = compute_specificity_and_balanced_accuracy(tn=0, fp=0, fn=5, tp=95)
+    assert result_no_neg["specificity"]       is None, (
+        "specificity must be None when TN+FP=0 (no actual-negative windows)"
+    )
+    assert result_no_neg["balanced_accuracy"] is None, (
+        "balanced_accuracy must be None when specificity is undefined"
+    )
+
+    # ── Case 3: All windows are normal (TP+FN == 0) ──────────────────────────
+    # recall is undefined, so balanced_accuracy is also undefined
+    # specificity itself is well-defined: 100 / (100 + 0) = 1.0
+    result_all_normal = compute_specificity_and_balanced_accuracy(tn=100, fp=0, fn=0, tp=0)
+    assert result_all_normal["specificity"] == pytest.approx(1.0, abs=1e-6)
+    assert result_all_normal["balanced_accuracy"] is None, (
+        "balanced_accuracy must be None when recall is undefined (TP+FN=0)"
+    )
+
+    # ── Case 4: Perfect classifier ───────────────────────────────────────────
+    # TN=50, FP=0, FN=0, TP=50 → specificity=1.0, recall=1.0, BA=1.0
+    result_perfect = compute_specificity_and_balanced_accuracy(tn=50, fp=0, fn=0, tp=50)
+    assert result_perfect["specificity"]       == pytest.approx(1.0, abs=1e-6)
+    assert result_perfect["balanced_accuracy"] == pytest.approx(1.0, abs=1e-6)
+
+    # ── Case 5: Worst-case classifier (everything wrong) ─────────────────────
+    # TN=0, FP=50, FN=50, TP=0 → specificity=0.0, recall=0.0, BA=0.0
+    result_worst = compute_specificity_and_balanced_accuracy(tn=0, fp=50, fn=50, tp=0)
+    assert result_worst["specificity"]       == pytest.approx(0.0, abs=1e-6)
+    assert result_worst["balanced_accuracy"] == pytest.approx(0.0, abs=1e-6)

@@ -47,6 +47,61 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Specificity / Balanced Accuracy helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_specificity_and_balanced_accuracy(
+    tn: int,
+    fp: int,
+    fn: int,
+    tp: int,
+) -> dict:
+    """
+    Compute specificity and balanced accuracy from a confusion matrix.
+
+    Returns ``None`` for any metric whose denominator is zero rather than
+    raising ``ZeroDivisionError``.  This can happen legitimately when the
+    test set contains only anomalies (TN+FP=0) or only normal windows
+    (TP+FN=0).
+
+    Parameters
+    ----------
+    tn, fp, fn, tp : int
+        True negatives, false positives, false negatives, true positives.
+
+    Returns
+    -------
+    dict with keys:
+        ``specificity``       — TN / (TN + FP), or None if undefined
+        ``balanced_accuracy`` — (recall + specificity) / 2, or None if either
+                                component is undefined
+    """
+    # Specificity = TN / (TN + FP).  Undefined when there are no true negatives
+    # and no false positives (i.e. no actual-negative windows in the split).
+    specificity: Optional[float] = (
+        tn / (tn + fp) if (tn + fp) > 0 else None
+    )
+
+    # Recall = TP / (TP + FN).  Undefined when there are no actual-positive
+    # windows in the split.
+    recall: Optional[float] = (
+        tp / (tp + fn) if (tp + fn) > 0 else None
+    )
+
+    # Balanced accuracy requires both components to be defined.
+    balanced_accuracy: Optional[float] = (
+        (recall + specificity) / 2
+        if (recall is not None and specificity is not None)
+        else None
+    )
+
+    return {
+        "specificity":       specificity,
+        "balanced_accuracy": balanced_accuracy,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Report container
 # ─────────────────────────────────────────────────────────────────────────────
 

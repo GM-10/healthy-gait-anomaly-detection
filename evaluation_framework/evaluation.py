@@ -63,6 +63,11 @@ class MetricsResult:
     fpr:       float = 0.0   # False Positive Rate = FP / (FP + TN)
     fnr:       float = 0.0   # False Negative Rate = FN / (FN + TP)
 
+    # Specificity and balanced accuracy (complement pair to recall)
+    # None when the denominator is zero (e.g. no normal windows in the split).
+    specificity:       Optional[float] = None
+    balanced_accuracy: Optional[float] = None
+
     # Ranking metrics (require continuous scores)
     roc_auc: float = float("nan")
     pr_auc:  float = float("nan")
@@ -130,6 +135,9 @@ def compute_metrics(
     fpr       = FP / (FP + TN) if (FP + TN) > 0 else 0.0
     fnr       = FN / (FN + TP) if (FN + TP) > 0 else 0.0
 
+    from evaluation_framework.statistics import compute_specificity_and_balanced_accuracy
+    _spec = compute_specificity_and_balanced_accuracy(TN, FP, FN, TP)
+
     roc_auc = float("nan")
     pr_auc  = float("nan")
     if scores is not None and len(np.unique(y_true)) == 2:
@@ -154,6 +162,14 @@ def compute_metrics(
         accuracy=round(accuracy, 6),
         fpr=round(fpr, 6),
         fnr=round(fnr, 6),
+        specificity=(
+            round(_spec["specificity"], 6)
+            if _spec["specificity"] is not None else None
+        ),
+        balanced_accuracy=(
+            round(_spec["balanced_accuracy"], 6)
+            if _spec["balanced_accuracy"] is not None else None
+        ),
         roc_auc=round(roc_auc, 6) if not np.isnan(roc_auc) else float("nan"),
         pr_auc=round(pr_auc, 6)  if not np.isnan(pr_auc)  else float("nan"),
     )
@@ -313,6 +329,7 @@ def build_comparison_dataframe(
         "model_name", "modality", "channel_name", "threshold_method",
         "threshold_value",
         "precision", "recall", "f1", "accuracy", "fpr", "fnr",
+        "specificity", "balanced_accuracy",
         "roc_auc", "pr_auc",
         "TP", "FP", "TN", "FN", "n_windows",
     ]
